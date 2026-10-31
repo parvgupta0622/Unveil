@@ -1,6 +1,7 @@
 import zipfile
 
 import numpy as np
+import pytest
 import trimesh
 
 from unveil.config import VerifyConfig
@@ -120,3 +121,96 @@ def test_texture_bake_and_textured_export(tmp_path):
     with zipfile.ZipFile(bundle.obj_zip) as zf:
         names = zf.namelist()
     assert any(n.endswith(".mtl") for n in names) and any(n.endswith(".png") for n in names)
+
+
+# ---------------------------------------------------------------------------------------------- hollow / solid
+def _solid_cup():
+    """A closed cylinder with a handle: what TripoSR returns for a mug (no cavity)."""
+    from skimage.measure import marching_cubes
+
+    g = np.linspace(-0.6, 0.6, 96)
+    x, y, z = np.meshgrid(g, g, g, indexing="ij")
+    body = np.minimum(0.3 - np.sqrt(x**2 + z**2), 0.4 - np.abs(y))
+    handle = 0.05 - np.sqrt((np.sqrt((x - 0.32) ** 2 + y**2) - 0.2) ** 2 + z**2)
+    verts, faces, _, _ = marching_cubes(np.maximum(body, handle).astype(np.float32), 0.0, spacing=(g[1] - g[0],) * 3)
+    mesh = trimesh.Trimesh(verts - 0.6, faces, process=False)
+    if signed_volume(mesh.vertices, mesh.faces) < 0:
+        mesh = trimesh.Trimesh(mesh.vertices, mesh.faces[:, ::-1], process=False)
+    return _colored(mesh)
+
+
+def test_voxelize_solid_matches_volume():
+    from unveil.mesh.hollow import voxelize_solid
+
+    box = trimesh.creation.box(extents=(0.4, 0.6, 0.2))
+    pitch = 0.01
+    occ = voxelize_solid(box.vertices, box.faces, np.array([-0.3, -0.4, -0.2]), pitch, (60, 80, 40))
+    assert occ.sum() * pitch**3 == pytest.approx(0.4 * 0.6 * 0.2, rel=0.03)
+
+
+def test_hollow_out_carves_open_cavity_with_walls():
+    from unveil.mesh import hollow_out, section_image
+
+    cup = _solid_cup()
+    result, reason = hollow_out(cup, wall_fraction=0.05, resolution=120)
+    assert result is not None, reason
+    s = result.stats
+    assert s.opened and 0.4 < s.cavity_fraction < 0.9
+    mesh = result.mesh
+    assert mesh.is_watertight and signed_volume(mesh.vertices, mesh.faces) > 0
+    assert signed_volume(mesh.vertices, mesh.faces) < 0.6 * signed_volume(cup.vertices, cup.faces)
+    np.testing.assert_allclose(mesh.extents, cup.extents, atol=0.03)  # outside shape unchanged
+    assert mesh.visual.kind == "vertex"
+
+    # Middle cross-section: material at the walls and the floor, empty in the centre.
+    sec = np.asarray(section_image(mesh.vertices, mesh.faces, size=128).convert("L")) < 200
+    rows, cols = np.nonzero(sec)
+    centre = sec[(rows.min() + rows.max()) // 2, (cols.min() + cols.max()) // 2 - 10]
+    assert not centre and sec.sum() < 0.5 * (np.asarray(section_image(cup.vertices, cup.faces, 128).convert("L")) < 200).sum()
+    # Points on the outer surface keep sampling where they are; cavity points move to the original surface.
+    pts = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.3]])
+    mapped = result.remap(pts)
+    assert np.linalg.norm(mapped[0]) > 0.2 and np.allclose(mapped[1], pts[1])
+
+
+def test_hollow_out_refuses_thin_objects():
+    from unveil.mesh import hollow_out
+
+    plate = _colored(trimesh.creation.box(extents=(0.8, 0.02, 0.8)))
+    result, reason = hollow_out(plate, wall_fraction=0.05, resolution=100)
+    assert result is None and "thin" in reason
+
+
+@pytest.mark.parametrize(
+    "prompt, hollow, label",
+    [
+        ("a glossy red ceramic coffee mug", True, "coffee mug"),
+        ("a glass vase with flowers", True, "vase"),
+        ("a modern table lamp with a white fabric shade", False, "lamp"),
+        ("a lamp with a glass shade", False, "lamp"),
+        ("a wooden dining chair", False, "chair"),
+        ("two bottles of wine", True, "bottle"),
+        ("a wine glass", True, "wine glass"),
+    ],
+)
+def test_interior_from_prompt(prompt, hollow, label):
+    from unveil.mesh import decide_interior
+
+    d = decide_interior(prompt)
+    assert (d.hollow, d.source) == (hollow, "prompt")
+    assert d.label in (label, label.split()[-1])
+
+
+def test_interior_from_clip_and_override():
+    from unveil.mesh import decide_interior
+
+    def bowl_like(labels):
+        p = np.full(len(labels), 0.2 / len(labels))
+        p[labels.index("bowl")] += 0.8
+        return p
+
+    d = decide_interior("", "auto", bowl_like)
+    assert d.hollow and d.source == "clip" and d.label == "bowl" and d.confidence > 0.8
+    assert not decide_interior("a mug", "solid").hollow
+    assert decide_interior("a chair", "hollow").hollow
+    assert not decide_interior("", "auto", None).hollow  # unknown -> solid

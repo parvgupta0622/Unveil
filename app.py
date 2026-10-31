@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 
-from unveil.config import UnveilConfig
+from unveil.config import REPO_ROOT, UnveilConfig
 from unveil.ui import build_demo
 
 
@@ -30,7 +30,7 @@ def main() -> None:
         share=args.share,
         server_name=args.host,
         server_port=args.port,
-        allowed_paths=[config.output_dir],
+        allowed_paths=[config.output_dir, str(REPO_ROOT / "examples")],  # examples load from any working directory
         show_error=True,
     )
 

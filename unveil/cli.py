@@ -11,7 +11,7 @@ import sys
 
 from PIL import Image
 
-from .config import DEPTH_PRESETS, UnveilConfig
+from .config import DEPTH_PRESETS, INTERIOR_MODES, UnveilConfig
 from .pipeline import PipelineError, RunOptions, RunResult, UnveilPipeline
 from .preprocess import SketchError
 
@@ -31,6 +31,8 @@ def main(argv=None) -> int:
     p.add_argument("--no-texture", action="store_true", help="skip UV texture baking (vertex colours only)")
     p.add_argument("--texture-resolution", type=int, default=1024)
     p.add_argument("--depth", default="1.0", help=f"depth scale or preset name {list(DEPTH_PRESETS)}")
+    p.add_argument("--interior", choices=list(INTERIOR_MODES), default="auto", help="hollow vessels (cups, bowls, ...) or keep solid")
+    p.add_argument("--wall", type=float, default=0.05, help="wall thickness of hollow objects, fraction of the object size")
     p.add_argument("--output-dir", default=None)
     p.add_argument("--low-vram", action="store_true")
     p.add_argument("--preload-only", action="store_true", help="download and load every model, then exit")
@@ -61,11 +63,13 @@ def main(argv=None) -> int:
         bake_texture=not args.no_texture,
         texture_resolution=args.texture_resolution,
         depth_scale=depth,
+        interior=args.interior,
+        wall_thickness=args.wall,
     )
     try:
         for ev in pipe.run(Image.open(args.sketch), opts):
             if isinstance(ev, RunResult):
-                print(json.dumps({"glb": str(ev.bundle.glb), "obj_zip": str(ev.bundle.obj_zip), "run_dir": str(ev.run_dir), "timings_s": ev.summary["timings_s"], "validation_passed": ev.bundle.report["passed"], "warnings": ev.warnings}, indent=2))
+                print(json.dumps({"outputs": ev.summary["outputs"], "all_formats_zip": str(ev.all_zip), "run_dir": str(ev.run_dir), "timings_s": ev.summary["timings_s"], "warnings": ev.warnings}, indent=2))
             elif ev.message:
                 print(f"[{ev.stage}] {ev.message}", flush=True)
     except (SketchError, PipelineError) as exc:

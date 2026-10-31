@@ -140,6 +140,14 @@ class ClipScorer:
         raw = (img @ ref.T).squeeze(-1).cpu().numpy()
         return [(_normalize(float(r), rng), float(r)) for r in raw]
 
+    def zero_shot(self, image: Image.Image, labels: Sequence[str]) -> np.ndarray:
+        """Probability of each label for one image (standard CLIP zero-shot classification)."""
+        import torch
+
+        img = self.image_embeddings([image])
+        txt = self.text_embeddings([f"a photo of a {label}" for label in labels])
+        return torch.softmax(100.0 * (img @ txt.T).squeeze(0), dim=-1).cpu().numpy()
+
 
 def score_variations(
     images: Sequence[Image.Image],

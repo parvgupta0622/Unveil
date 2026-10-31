@@ -66,6 +66,16 @@ def export_asset(asset: MeshAsset, out_dir: Path, depth_scale: float = 1.0, stem
     return bundle
 
 
+def zip_bundles(bundles: List[ExportBundle], zip_path: Path) -> Path:
+    """One archive with every model in every format: <stem>.glb and <stem>_obj/<stem>.obj (+ .mtl / texture)."""
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for b in bundles:
+            zf.write(b.glb, arcname=b.glb.name)
+            for f in sorted(b.obj.parent.iterdir()):
+                zf.write(f, arcname=f"{b.obj.parent.name}/{f.name}")
+    return zip_path
+
+
 def _has_texture(mesh: trimesh.Trimesh) -> bool:
     if not isinstance(mesh.visual, trimesh.visual.TextureVisuals) or mesh.visual.uv is None:
         return False

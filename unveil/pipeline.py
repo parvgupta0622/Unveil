@@ -2,14 +2,18 @@
 
 `UnveilPipeline.run()` is a generator: it yields `StageEvent`s while it works (the UI turns them into a
 live progress board) and finally yields a `RunResult`. Every model is lazily loaded on first use.
+
+A run has two phases that can also be driven separately, so users can pick the ControlNet variations:
+`run_images()` (preprocess, generate, score -> `ImageRun`) and `run_3d()` (TripoSR candidates, hollow/solid
+interior, refine, export -> `RunResult`, one final model per selected variation).
 """
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import trimesh
@@ -22,18 +26,24 @@ from .mesh import (
     CandidateScore,
     CleanStats,
     ExportBundle,
+    HollowStats,
+    InteriorDecision,
     MeshAsset,
     MeshError,
     bake_texture,
     clean_mesh,
+    decide_interior,
     decimate,
     export_asset,
+    hollow_out,
     score_candidate,
+    section_image,
     smooth_mesh,
+    zip_bundles,
 )
-from .preprocess import SketchError, preprocess_sketch
+from .preprocess import SketchError, SketchPrep, preprocess_sketch
 from .reconstruction import ReconstructionError, create_reconstructor
-from .scoring import ClipScorer, rank_variations, score_variations
+from .scoring import ClipScorer, VariationScore, rank_variations, score_variations
 from .utils import LOG, StageTimer, flatten_alpha, free_gpu_memory, gpu_total_gb, new_run_id, resolve_device, write_json
 
 STAGES: List[Tuple[str, str]] = [
@@ -41,9 +51,11 @@ STAGES: List[Tuple[str, str]] = [
     ("generate", "ControlNet variations"),
     ("select_image", "Variation scoring & selection"),
     ("reconstruct", "TripoSR candidates & verification"),
+    ("interior", "Hollow / solid interior"),
     ("refine", "Mesh refinement & texture"),
     ("export", "Export & validation"),
 ]
+IMAGE_STAGES = STAGES[:3]
 
 
 class PipelineError(RuntimeError):
@@ -68,6 +80,8 @@ class RunOptions:
     bake_texture: bool = True
     texture_resolution: int = 1024
     depth_scale: float = 1.0
+    interior: str = "auto"  # auto | hollow | solid
+    wall_thickness: float = 0.05  # fraction of the object's largest dimension
 
 
 @dataclass
@@ -106,15 +120,80 @@ class Candidate:
 
 
 @dataclass
+class ImageRun:
+    """Result of the image phase: everything the 3D phase needs, kept in memory so users can re-pick."""
+
+    run_id: str
+    run_dir: Path
+    opts: RunOptions
+    prompt: str
+    prep: SketchPrep
+    prep_images: List[Tuple[Image.Image, str]]
+    variations: List[Variation]
+    rgbas: List[Image.Image]
+    scores: List[VariationScore]
+    ranking: List[int]
+    variation_gallery: List[Tuple[Image.Image, str]]
+    warnings: List[str]
+    timings: Dict[str, float]
+
+    def auto_selection(self, k: int) -> List[int]:
+        return self.ranking[: max(1, min(k, len(self.ranking)))]
+
+    def score_rows(self) -> List[Dict[str, Any]]:
+        rank = {vi: r + 1 for r, vi in enumerate(self.ranking)}
+        return [
+            dict(asdict(s), level=self.variations[s.index].level.name, conditioning_scale=self.variations[s.index].level.conditioning_scale, seed=self.variations[s.index].seed, rank=rank[s.index])
+            for s in self.scores
+        ]
+
+
+@dataclass
+class FinalOutput:
+    """One finished 3D model: the best verified TripoSR candidate for one selected variation."""
+
+    slot: int
+    variation: int
+    level: str
+    candidate: int
+    asset_path: Path
+    bundle: ExportBundle
+    interior: InteriorDecision
+    hollow: Optional[HollowStats]
+    section: Image.Image
+    score: CandidateScore
+
+    def summary(self) -> dict:
+        return {
+            "model": self.slot + 1,
+            "variation": self.variation,
+            "level": self.level,
+            "candidate": self.candidate,
+            "files": {"glb": str(self.bundle.glb), "obj_zip": str(self.bundle.obj_zip)},
+            "interior": asdict(self.interior),
+            "hollow": asdict(self.hollow) if self.hollow else None,
+            "validation_passed": self.bundle.report.get("passed"),
+        }
+
+
+@dataclass
 class RunResult:
     run_id: str
     run_dir: Path
-    bundle: ExportBundle
+    build_dir: Path
+    outputs: List[FinalOutput]
+    all_zip: Path
+    selection: List[int]
     prep_images: List[Tuple[Image.Image, str]]
     variation_gallery: List[Tuple[Image.Image, str]]
     candidate_gallery: List[Tuple[Image.Image, str]]
     summary: Dict[str, Any]
     warnings: List[str]
+
+    @property
+    def bundle(self) -> ExportBundle:
+        """The first (highest-ranked selected) model."""
+        return self.outputs[0].bundle
 
 
 def select_best(candidates: List[Candidate]) -> Optional[Candidate]:
@@ -155,7 +234,8 @@ class UnveilPipeline:
         self.clip = ClipScorer(self.cfg.scoring.clip_model, self.device, self.dtype)
         self.background = BackgroundRemover(self.cfg.rembg_model)
         self.reconstructor = create_reconstructor(rc.backend, device=self.device, model_id=rc.model_id, chunk_size=rc.chunk_size, repo_path=rc.repo_path)
-        self._handles: "OrderedDict[str, Any]" = OrderedDict()
+        self._handles: "OrderedDict[str, Any]" = OrderedDict()  # asset path -> (colour handle, remap)
+        self._image_runs: "OrderedDict[str, ImageRun]" = OrderedDict()
 
     # ------------------------------------------------------------------ model residency
     def _use(self, *active: str) -> None:
@@ -183,16 +263,34 @@ class UnveilPipeline:
         self._use("reconstructor")
         self.reconstructor.load()
 
-    def _remember_handle(self, run_id: str, handle: Any) -> None:
-        self._handles[run_id] = handle
-        while len(self._handles) > 4:
-            self._handles.popitem(last=False)
+    def _remember(self, cache: "OrderedDict[str, Any]", key: str, value: Any, limit: int) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
 
-    # ------------------------------------------------------------------ main entry point
+    # ------------------------------------------------------------------ entry points
     def run(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, RunResult]]:
-        stage = "preprocess"
+        """Full automatic run: images, then 3D from the top-ranked `opts.top_k_images` variations."""
+        yield from self._guard(self._run(sketch, opts), "preprocess")
+
+    def run_images(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, ImageRun]]:
+        """Image phase only; finishes with an `ImageRun` whose variations the user can choose from."""
+        yield from self._guard(self._images(sketch, opts), "preprocess")
+
+    def run_3d(self, run_id: str, selection: List[int], opts: Optional[RunOptions] = None) -> Iterator[Union[StageEvent, RunResult]]:
+        """3D phase for user-chosen variation indices of an earlier `run_images()`/`run()`."""
+        img = self._image_runs.get(run_id)
+        if img is None:
+            raise PipelineError("reconstruct", "This run's images are no longer in memory - generate the images again.")
+        if opts is not None:  # the 3D settings may change between builds; the image settings may not
+            keep = ("prompt", "negative_prompt", "control_mode", "seed", "num_variations", "steps", "guidance_scale")
+            opts = replace(opts, **{k: getattr(img.opts, k) for k in keep})
+        yield from self._guard(self._models(img, selection, opts or img.opts, "user"), "reconstruct")
+
+    def _guard(self, events: Iterator[Any], stage: str) -> Iterator[Any]:
         try:
-            for event in self._run(sketch, opts):
+            for event in events:
                 if isinstance(event, StageEvent):
                     stage = event.stage
                 yield event
@@ -206,6 +304,16 @@ class UnveilPipeline:
             raise PipelineError(stage, f"{type(exc).__name__}: {exc}") from exc
 
     def _run(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, RunResult]]:
+        img = None
+        for event in self._images(sketch, opts):
+            if isinstance(event, ImageRun):
+                img = event
+            else:
+                yield event
+        yield from self._models(img, img.auto_selection(opts.top_k_images), opts, "auto")
+
+    # ------------------------------------------------------------------ phase 1: images
+    def _images(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, ImageRun]]:
         gen_cfg = self.cfg.generation
         warnings: List[str] = []
         timer = StageTimer()
@@ -243,7 +351,8 @@ class UnveilPipeline:
                 image = self.generator.generate(control, prompt, negative, level, seed, opts.control_mode, opts.steps, opts.guidance_scale)
                 image.save(run_dir / f"variation_{i}_{level.name}.png")
                 variations.append(Variation(i, level, seed, image))
-        yield StageEvent("generate", "done", f"{len(variations)} images generated", payload={"variations": [(v.image, f"{v.level.name} · seed {v.seed}") for v in variations]})
+                yield StageEvent("generate", "progress", payload={"variations": [(v.image, f"#{v.index + 1} {v.level.name} · seed {v.seed}") for v in variations]})
+        yield StageEvent("generate", "done", f"{len(variations)} images generated", payload={"variations": [(v.image, f"#{v.index + 1} {v.level.name} · seed {v.seed}") for v in variations]})
 
         # 3. Score variations: sketch IoU + CLIP + clean background --------------------------
         yield StageEvent("select_image", "start", "Removing backgrounds and scoring variations")
@@ -257,23 +366,42 @@ class UnveilPipeline:
         if not scores[ranking[0]].passes_floor:
             warnings.append(f"No variation reached sketch IoU ≥ {self.cfg.scoring.iou_floor}; using the best available. Try 'Precise' mode or a clearer outline.")
         top = ranking[: max(1, min(opts.top_k_images, len(ranking)))]
+        rank = {vi: r + 1 for r, vi in enumerate(ranking)}
         variation_gallery = []
         for v, s in zip(variations, scores):
             mark = "★ " if v.index == top[0] else ("☆ " if v.index in top else "")
-            variation_gallery.append((v.image, f"{mark}{v.level.name} · total {s.total:.2f} · IoU {s.iou:.2f} · CLIP {s.clip:.2f} · clean {s.clean:.2f}"))
-        yield StageEvent("select_image", "done", f"Best: {variations[top[0]].level.name}", payload={"variations": variation_gallery})
+            variation_gallery.append((v.image, f"{mark}#{v.index + 1} {v.level.name} · rank {rank[v.index]} · total {s.total:.2f} · IoU {s.iou:.2f} · CLIP {s.clip:.2f} · clean {s.clean:.2f}"))
+        img_run = ImageRun(run_id, run_dir, opts, prompt, prep, prep_images, variations, rgbas, scores, ranking, variation_gallery, warnings, dict(timer.timings))
+        self._remember(self._image_runs, run_id, img_run, 4)
+        write_json({"run_id": run_id, "prompt_used": prompt, "options": asdict(opts), "variations": img_run.score_rows(), "variation_ranking": ranking}, run_dir / "images.json")
+        yield StageEvent("select_image", "done", f"Best: #{top[0] + 1} {variations[top[0]].level.name}", payload={"variations": variation_gallery, "image_run": img_run})
+        yield img_run
+
+    # ------------------------------------------------------------------ phase 2: 3D
+    def _models(self, img: ImageRun, selection: List[int], opts: RunOptions, selected_by: str) -> Iterator[Union[StageEvent, RunResult]]:
+        selection = list(dict.fromkeys(int(i) for i in selection))
+        limit = self.cfg.hollow.max_outputs
+        if not selection or any(not 0 <= i < len(img.variations) for i in selection):
+            raise PipelineError("reconstruct", f"Choose between 1 and {limit} of the {len(img.variations)} variations.")
+        if len(selection) > limit:
+            raise PipelineError("reconstruct", f"Choose at most {limit} variations (each one becomes a final 3D model).")
+        variations, prep = img.variations, img.prep
+        warnings = list(img.warnings)
+        timer = StageTimer()
+        build_dir = img.run_dir / ("3d_v" + "-".join(str(i + 1) for i in selection))
+        build_dir.mkdir(parents=True, exist_ok=True)
 
         # 4. TripoSR candidates -> cleanup -> verification -------------------------------
-        jobs = [(vi, ratio) for vi in top for ratio in opts.foreground_ratios]
+        jobs = [(vi, ratio) for vi in selection for ratio in opts.foreground_ratios]
         yield StageEvent("reconstruct", "start", f"Reconstructing {len(jobs)} candidates with TripoSR")
         candidates: List[Candidate] = []
         with timer("reconstruct"):
             self._use("reconstructor")
             for ci, (vi, ratio) in enumerate(jobs):
-                yield StageEvent("reconstruct", "progress", f"Candidate {ci + 1}/{len(jobs)} · variation {variations[vi].level.name}, foreground {ratio:.2f}", fraction=ci / len(jobs))
+                yield StageEvent("reconstruct", "progress", f"Candidate {ci + 1}/{len(jobs)} · variation #{vi + 1} {variations[vi].level.name}, foreground {ratio:.2f}", fraction=ci / len(jobs))
                 cand = Candidate(ci, vi, ratio)
                 try:
-                    cand.input_image = self.reconstructor.prepare_input(rgbas[vi], ratio)
+                    cand.input_image = self.reconstructor.prepare_input(img.rgbas[vi], ratio)
                     result = self.reconstructor.reconstruct(cand.input_image, opts.mc_resolution, self.cfg.reconstruction.mc_threshold)
                     mesh, cand.stats = clean_mesh(result.mesh)
                     cand.mesh = smooth_mesh(mesh, opts.smooth_iterations)
@@ -283,100 +411,165 @@ class UnveilPipeline:
                     cand.error = str(exc)
                     warnings.append(f"Candidate {ci + 1} failed: {exc}")
                 candidates.append(cand)
-        best = select_best(candidates)
-        if best is None:
+        finals = []
+        for vi in selection:  # one final model per selected variation: its best verified framing
+            best = select_best([c for c in candidates if c.variation == vi])
+            if best is None:
+                warnings.append(f"Every TripoSR candidate for variation #{vi + 1} failed; it produced no model.")
+                continue
+            if not best.score.valid:
+                warnings.append(f"Variation #{vi + 1}: no candidate passed validity checks ({best.score.reason}); using the highest-scoring one.")
+            finals.append(best)
+        if not finals:
             raise PipelineError("reconstruct", "All TripoSR candidates failed. Try a sketch with a clearer closed outline.")
-        if not best.score.valid:
-            warnings.append(f"No candidate passed validity checks ({best.score.reason}); returning the highest-scoring one.")
+        final_ids = [f.index for f in finals]
         candidate_gallery = []
         for c in candidates:
             if c.ok:
-                mark = "★ " if c is best else ""
+                mark = f"★ model {final_ids.index(c.index) + 1} · " if c.index in final_ids else ""
                 s = c.score
-                caption = f"{mark}#{c.index + 1} {variations[c.variation].level.name} @ {c.foreground_ratio:.2f} · total {s.total:.2f} · IoU {s.iou:.2f} · edge {s.edge:.2f} · kept {s.retention:.0%}"
+                caption = f"{mark}#{c.index + 1} variation #{c.variation + 1} {variations[c.variation].level.name} @ {c.foreground_ratio:.2f} · total {s.total:.2f} · IoU {s.iou:.2f} · edge {s.edge:.2f} · kept {s.retention:.0%}"
                 if not s.valid:
                     caption += f" · invalid: {s.reason}"
-                candidate_gallery.append((c.overlay, caption))
-                c.overlay.save(run_dir / f"candidate_{c.index}_overlay.png")
+                candidate_gallery.append((_side_by_side(c.input_image, c.overlay), caption))
+                c.overlay.save(build_dir / f"candidate_{c.index}_overlay.png")
             else:
-                candidate_gallery.append((Image.new("RGB", (256, 256), (245, 245, 245)), f"#{c.index + 1} failed: {c.error}"))
-        yield StageEvent("reconstruct", "done", f"Best: candidate #{best.index + 1}", payload={"candidates": candidate_gallery})
+                candidate_gallery.append((Image.new("RGB", (512, 256), (245, 245, 245)), f"#{c.index + 1} failed: {c.error}"))
+        yield StageEvent("reconstruct", "done", "Best: " + ", ".join(f"candidate #{f.index + 1}" for f in finals), payload={"candidates": candidate_gallery})
 
-        # 5. Refine: decimate + optional UV texture bake ----------------------------------
-        yield StageEvent("refine", "start", "Baking UV texture" if opts.bake_texture else "Finalising mesh (vertex colours)")
+        # 5. Interior: hollow vessels get a real cavity, everything else stays solid -----------
+        yield StageEvent("interior", "start", "Deciding hollow vs solid")
+        shaped = []  # (candidate, mesh, decision, hollow stats, colour-query remap)
+        with timer("interior"):
+            for slot, c in enumerate(finals):
+                image = variations[c.variation].image
+                zero_shot = None
+                if opts.interior == "auto" and hasattr(self.clip, "zero_shot"):
+                    self._use("clip")
+                    zero_shot = lambda labels, image=image: self.clip.zero_shot(image, labels)  # noqa: E731
+                decision = decide_interior(opts.prompt, opts.interior, zero_shot)
+                mesh, stats, remap = c.mesh, None, None
+                if decision.hollow:
+                    yield StageEvent("interior", "progress", f"Model {slot + 1}: carving the cavity ({decision.describe()})", fraction=slot / len(finals))
+                    hollowed, reason = hollow_out(c.mesh, opts.wall_thickness, self.cfg.hollow.voxel_resolution, min(opts.smooth_iterations, 3))
+                    if hollowed is None:
+                        warnings.append(f"Model {slot + 1} was kept solid: {reason}.")
+                    else:
+                        mesh, stats, remap = hollowed.mesh, hollowed.stats, hollowed.remap
+                shaped.append((c, mesh, decision, stats, remap))
+        yield StageEvent("interior", "done", " · ".join(f"Model {i + 1}: {'hollow' if s else 'solid'}" for i, (_, _, _, s, _) in enumerate(shaped)))
+
+        # 6. Refine: decimate + optional UV texture bake ----------------------------------
+        yield StageEvent("refine", "start", "Baking UV textures" if opts.bake_texture else "Finalising meshes (vertex colours)")
+        assets = []
         with timer("refine"):
-            asset = MeshAsset.from_trimesh(decimate(best.mesh, self.cfg.mesh.max_faces))
-            if opts.bake_texture:
-                asset = self._bake(asset, best.handle, opts.texture_resolution, warnings)
-            asset.save(run_dir / "asset.npz")
-        self._remember_handle(run_id, best.handle)
+            for slot, (c, mesh, decision, stats, remap) in enumerate(shaped):
+                yield StageEvent("refine", "progress", f"Model {slot + 1}/{len(shaped)}", fraction=slot / len(shaped))
+                asset = MeshAsset.from_trimesh(decimate(mesh, self.cfg.mesh.max_faces))
+                if opts.bake_texture:
+                    asset = self._bake(asset, c.handle, opts.texture_resolution, warnings, remap)
+                asset_path = build_dir / f"model{slot + 1}_{variations[c.variation].level.name}.npz"
+                asset.save(asset_path)
+                self._remember(self._handles, str(asset_path), (c.handle, remap), 8)
+                assets.append((asset_path, asset))
         for c in candidates:  # release candidate meshes/handles we no longer need
             c.mesh = c.handle = None
-        yield StageEvent("refine", "done", f"{len(asset.faces):,} faces · " + (f"{opts.texture_resolution}px UV texture" if asset.textured else "vertex colours"))
+        yield StageEvent("refine", "done", " · ".join(f"{len(a.faces):,} faces" for _, a in assets) + " · " + (f"{opts.texture_resolution}px UV textures" if opts.bake_texture else "vertex colours"))
 
-        # 6. Export + validation --------------------------------------------------------
-        yield StageEvent("export", "start", "Writing GLB/OBJ and re-opening them to validate")
+        # 7. Export + validation --------------------------------------------------------
+        yield StageEvent("export", "start", "Writing GLB/OBJ for every model and re-opening them to validate")
+        outputs: List[FinalOutput] = []
         with timer("export"):
-            bundle = export_asset(asset, run_dir, opts.depth_scale)
-        if not bundle.report["passed"]:
-            warnings.append("Some export validation checks failed - see the validation report.")
+            for slot, ((asset_path, asset), (c, _, decision, stats, _)) in enumerate(zip(assets, shaped)):
+                bundle = export_asset(asset, build_dir, opts.depth_scale, asset_path.stem)
+                section = section_image(asset.vertices, asset.faces)
+                section.save(build_dir / f"{asset_path.stem}_section.png")
+                outputs.append(FinalOutput(slot, c.variation, variations[c.variation].level.name, c.index, asset_path, bundle, decision, stats, section, c.score))
+                if not bundle.report["passed"]:
+                    warnings.append(f"Model {slot + 1}: some export validation checks failed - see its validation report.")
+            all_zip = zip_bundles([o.bundle for o in outputs], build_dir / f"unveil_{img.run_id}_all_depth{opts.depth_scale:.2f}.zip")
 
+        gen_cfg = self.cfg.generation
+        timings = dict(img.timings, **timer.timings)
         summary = {
-            "run_id": run_id,
+            "run_id": img.run_id,
             "device": self.device,
             "low_vram": self.low_vram,
             "options": asdict(opts),
-            "prompt_used": prompt,
+            "prompt_used": img.prompt,
             "models": {
                 "base": gen_cfg.base_model,
-                "controlnet": gen_cfg.controlnets[opts.control_mode],
+                "controlnet": gen_cfg.controlnets[img.opts.control_mode],
                 "clip": self.cfg.scoring.clip_model,
                 "rembg": self.cfg.rembg_model,
                 "reconstruction": f"{self.reconstructor.name} ({self.cfg.reconstruction.model_id})",
             },
-            "variations": [dict(asdict(s), level=variations[s.index].level.name, seed=variations[s.index].seed) for s in scores],
-            "variation_ranking": ranking,
+            "variations": img.score_rows(),
+            "variation_ranking": img.ranking,
+            "selection": {"variations": selection, "selected_by": selected_by},
             "candidates": [c.summary() for c in candidates],
-            "selected_candidate": best.index,
-            "mesh": {"vertices": int(len(asset.vertices)), "faces": int(len(asset.faces)), "textured": asset.textured},
-            "timings_s": dict(timer.timings, total=timer.total),
-            "validation": bundle.report,
+            "outputs": [o.summary() for o in outputs],
+            "timings_s": dict(timings, total=round(sum(timings.values()), 3)),
+            "validation": [o.bundle.report for o in outputs],
             "warnings": warnings,
             "versions": _versions(),
         }
-        write_json(summary, run_dir / "run.json")
-        LOG.info("Run %s finished in %.1fs -> %s", run_id, timer.total, bundle.glb)
-        yield StageEvent("export", "done", "Validation passed" if bundle.report["passed"] else "Validation found issues")
-        yield RunResult(run_id, run_dir, bundle, prep_images, variation_gallery, candidate_gallery, summary, warnings)
+        write_json(summary, build_dir / "run.json")
+        write_json(summary, img.run_dir / "run.json")
+        LOG.info("Run %s build %s finished in %.1fs -> %s", img.run_id, build_dir.name, summary["timings_s"]["total"], [str(o.bundle.glb) for o in outputs])
+        passed = all(o.bundle.report["passed"] for o in outputs)
+        yield StageEvent("export", "done", f"{len(outputs)} model(s) · " + ("validation passed" if passed else "validation found issues"))
+        yield RunResult(img.run_id, img.run_dir, build_dir, outputs, all_zip, selection, img.prep_images, img.variation_gallery, candidate_gallery, summary, warnings)
 
-    def _bake(self, asset: MeshAsset, handle: Any, resolution: int, warnings: List[str]) -> MeshAsset:
+    def _bake(self, asset: MeshAsset, handle: Any, resolution: int, warnings: List[str], remap: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> MeshAsset:
         if not self.reconstructor.supports_color_query or handle is None:
             warnings.append("Texture baking is not supported by this backend; using vertex colours.")
             return asset
+        remap = remap or (lambda pts: pts)
         try:
             self._use("reconstructor")
-            return bake_texture(asset, lambda pts: self.reconstructor.query_color(handle, pts), resolution)
+            return bake_texture(asset, lambda pts: self.reconstructor.query_color(handle, remap(pts)), resolution)
         except Exception as exc:  # noqa: BLE001 - vertex colours are a safe fallback
             LOG.exception("Texture bake failed")
             warnings.append(f"Texture bake failed ({type(exc).__name__}: {exc}); using vertex colours.")
             return asset
 
     # ------------------------------------------------------------------ post-run actions
-    def reexport(self, run_dir: Path, depth_scale: float) -> ExportBundle:
-        """Re-export a finished run with a new depth scale (geometry change, no re-inference)."""
-        asset_path = Path(run_dir) / "asset.npz"
-        if not asset_path.exists():
+    @staticmethod
+    def _build_assets(build_dir: Path) -> List[Path]:
+        paths = sorted(Path(build_dir).glob("model*.npz"))
+        if not paths:
             raise PipelineError("export", "No mesh found for this run - generate a model first.")
-        return export_asset(MeshAsset.load(asset_path), Path(run_dir), depth_scale)
+        return paths
 
-    def bake_existing(self, run_id: str, run_dir: Path, depth_scale: float, resolution: int = 1024) -> Tuple[ExportBundle, List[str]]:
-        asset_path = Path(run_dir) / "asset.npz"
-        asset = MeshAsset.load(asset_path)
+    def reexport(self, build_dir: Path, depth_scale: float) -> Tuple[List[ExportBundle], Path]:
+        """Re-export every model of a build with a new depth scale (geometry change, no re-inference)."""
+        build_dir = Path(build_dir)
+        bundles = [export_asset(MeshAsset.load(p), build_dir, depth_scale, p.stem) for p in self._build_assets(build_dir)]
+        return bundles, zip_bundles(bundles, build_dir / f"unveil_{build_dir.parent.name}_all_depth{depth_scale:.2f}.zip")
+
+    def bake_existing(self, build_dir: Path, depth_scale: float, resolution: int = 1024) -> Tuple[List[ExportBundle], Path, List[str]]:
         warnings: List[str] = []
-        if not asset.textured:
-            handle = self._handles.get(run_id)
+        for asset_path in self._build_assets(build_dir):
+            asset = MeshAsset.load(asset_path)
+            if asset.textured:
+                continue
+            handle, remap = self._handles.get(str(asset_path), (None, None))
             if handle is None:
                 raise PipelineError("refine", "This run's colour field is no longer in memory; re-run with 'Bake UV texture' enabled.")
-            asset = self._bake(asset, handle, resolution, warnings)
+            asset = self._bake(asset, handle, resolution, warnings, remap)
             asset.save(asset_path)
-        return export_asset(asset, Path(run_dir), depth_scale), warnings
+        bundles, all_zip = self.reexport(build_dir, depth_scale)
+        return bundles, all_zip, warnings
+
+
+def _side_by_side(left: Optional[Image.Image], right: Image.Image) -> Image.Image:
+    """TripoSR input framing next to its verification overlay."""
+    h = right.height
+    if left is None:
+        return right
+    left = left.convert("RGB").resize((h, h))
+    out = Image.new("RGB", (left.width + right.width + 8, h), (255, 255, 255))
+    out.paste(left, (0, 0))
+    out.paste(right.convert("RGB"), (left.width + 8, 0))
+    return out
