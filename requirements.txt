@@ -1,0 +1,24 @@
+# PyTorch is NOT listed: Colab ships a CUDA build. Locally, install torch for your CUDA version first
+# (https://pytorch.org/get-started/locally/).
+diffusers>=0.30.0
+transformers>=4.40.0
+accelerate>=0.30.0
+huggingface_hub>=0.23.0
+safetensors>=0.4.0
+# TripoSR runtime deps (its own requirements.txt also pins torchmcubes/moderngl, which we do not need)
+omegaconf>=2.3.0
+einops>=0.7.0
+imageio>=2.31
+# Geometry / imaging
+trimesh>=4.0.5
+xatlas>=0.0.9
+fast-simplification>=0.1.7
+scikit-image>=0.21
+scipy>=1.10
+opencv-python-headless>=4.8
+numpy>=1.24
+Pillow>=10.0
+rembg>=2.0.50
+onnxruntime>=1.16
+# UI (pinned to the 5.x API the interface was written against)
+gradio>=5.9,<6
