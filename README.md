@@ -59,14 +59,15 @@ No Hugging Face token is needed: every model is public and ungated.
    - **Freeform**: scribble ControlNet; tolerant of rough, wobbly or open strokes.
 4. **Interior.** *Auto-detect* (default) hollows vessels such as cups, mugs, bowls, bottles, vases and jars, and keeps everything else solid (§4.4). *Hollow* / *Solid* force either. **Wall thickness** is a fraction of the object's largest dimension (default 5 %).
 5. **Bake UV texture** (default on): bakes a UV texture so colour survives in OBJ and in every DCC tool. Turn it off for faster vertex-colour output; you can still bake later with the *Bake UV textures for these models* button.
-6. Press **✨ Generate 3D** (fully automatic), or **🖼️ Images first — I'll pick** to stop after the ControlNet images and choose yourself. A progress card shows each stage live, with timings.
-7. **Follow the pipeline.** The page is laid out as numbered steps, each with its previews:
-   - **② Sketch preprocessing:** input, cleaned strokes, ControlNet conditioning image, filled silhouette.
-   - **③ ControlNet variations:** all four images, a score table (rank, IoU, CLIP, clean, total, structure check) and an explanation of how the best one is chosen. **Tick one or two variations and press *Build 3D from selected*** to (re)build the 3D models from them. This reuses the images; only the 3D stages run again.
-   - **④ TripoSR candidates:** for every candidate, the TripoSR input next to its reprojection overlay (blue = mesh, red = sketch outline, ★ = became a final model).
-   - **⑤ Final 3D models:** one card per model with an orbitable 3D preview, the hollow/solid decision, a **cross-section** cut through the middle (shows walls and cavity), downloads and the export validation report.
+6. Press **✨ Generate 3D** (fully automatic), or **🖼️ Images first — I'll pick** to stop after the ControlNet images and choose yourself. A progress bar with one pill per stage (timings included) stays pinned to the top of the window while the run is going.
+7. **Follow the pipeline.** The page is one column: **① Settings** and **② Your sketch** on top, then each result section appears below as soon as it has something to show (nothing is shown as an empty placeholder), and the page scrolls to it unless you are scrolling yourself:
+   - **③ Sketch preprocessing:** input, cleaned strokes, ControlNet conditioning image, filled silhouette.
+   - **④ ControlNet variations:** all four images, a score table (rank, IoU, CLIP, clean, total, structure check) and an explanation of how the best one is chosen. **Tick one or two variations and press *Build 3D from selected*** to (re)build the 3D models from them. This reuses the images; only the 3D stages run again.
+   - **⑤ TripoSR candidates:** for every candidate, the TripoSR input next to its reprojection overlay (blue = mesh, red = sketch outline, ★ = became a final model).
+   - **⑥ Final 3D models:** one card per model with the exported **OBJ rendered live** (three.js: drag to turn it in any direction, click then scroll to zoom, right-drag to pan, auto-spin / reset / wireframe buttons), the hollow/solid decision, a **cross-section** cut through the middle (shows walls and cavity), downloads and the export validation report.
 8. **Depth.** Choose *Thin / Medium / Thick* or drag the slider (0.3×–2.5×). This **rescales the real geometry** of every model along the view axis and **re-exports** all files, with the validation reports refreshed. No re-inference is needed.
-9. **Download.** Each model card offers its `.glb` and its OBJ zip (`.obj` + `.mtl` + texture `.png`). **📦 Everything** is one zip with every model in every format.
+9. **Errors** appear once, in a single popup naming the stage that failed; the progress bar marks that stage red. Your sketch and settings stay as they were.
+10. **Download.** Each model card offers its `.glb` and its OBJ zip (`.obj` + `.mtl` + texture `.png`). **📦 Everything** is one zip with every model in every format.
 
 The *Advanced settings* panel exposes the seed, number of variations (3–4), diffusion steps, CFG, how many variations are auto-sent to TripoSR (1–2), marching-cubes resolution, smoothing, texture resolution and an extra negative prompt.
 
@@ -85,7 +86,7 @@ The *Advanced settings* panel exposes the seed, number of variations (3–4), di
 | Texture | `unveil/mesh/texture.py` | xatlas UV unwrap → CPU UV rasterisation → barycentric lift to 3D → query TripoSR's colour field → nearest-texel seam padding. No OpenGL. |
 | Export & validation | `unveil/mesh/export.py` | Depth scaling, centring, GLB (PBR material) + OBJ/MTL/PNG + zip. Each file is **re-opened** with trimesh to check that it opens, has non-empty finite geometry, keeps its face count, has 3D extent, and keeps its texture or vertex colours. |
 | Orchestration | `unveil/pipeline.py` | Generators of `StageEvent`s. `run()` = `run_images()` (→ `ImageRun`) + `run_3d(selection)` (→ `RunResult` with one `FinalOutput` per selected variation). Lazy model loading, GPU residency management, stage-tagged errors, OOM handling, `run.json`. |
-| UI / CLI | `unveil/ui.py`, `app.py`, `unveil/cli.py` | Gradio 5 Blocks UI (numbered step cards, variation picker, two model cards); headless CLI with identical behaviour. |
+| UI / CLI | `unveil/ui.py`, `app.py`, `unveil/cli.py` | Gradio 5 Blocks UI (single column, sections revealed as results arrive, variation picker, model cards with a three.js OBJ viewer, one error popup); headless CLI with identical behaviour. |
 
 ## 4. Key features in detail
 
@@ -253,8 +254,9 @@ python -m pytest -q tests
 | "The sketch looks empty" | Strokes too faint or tiny. Use a darker or thicker pen, or upload a higher-contrast scan. |
 | Generated image ignores the sketch | Use **Precise** mode, and make sure the outline is closed. Check the *ControlNet variations* tab: IoU < 0.35 is flagged. |
 | Mesh far too thin/thick | Use the depth presets or slider. |
-| Chosen candidate looks wrong | See step ④. Pick other variations in step ③ and press *Build 3D from selected*, or try a different seed. |
+| Chosen candidate looks wrong | See step ⑤. Pick other variations in step ④ and press *Build 3D from selected*, or try a different seed. |
 | Cup/bowl came out solid (or a solid object came out hollow) | Name the object in the description, or set *Interior* to *Hollow* / *Solid*. The model card says why it decided. |
+| 3D preview says it could not load | The OBJ viewer loads three.js from cdn.jsdelivr.net in your browser; a blocked network or ad-blocker stops it. The downloads are unaffected. |
 | rembg/onnxruntime errors | The pipeline falls back to border-colour keying automatically (a warning is logged). `pip install rembg onnxruntime` to restore. |
 | Gradio link not printed / expired | Re-run the launch cell. Share links last 72 h. |
 | Slow first run | One-time weight download (~6 GB). Run `scripts/download_weights.py` first. |
