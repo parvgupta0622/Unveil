@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from .config import ScoringConfig
-from .utils import LOG
+from .utils import LOG, load_without_empty_weights
 
 # Typical cosine ranges for CLIP ViT-B/32, used to map raw similarities onto [0, 1].
 TEXT_COS_RANGE = (0.15, 0.35)
@@ -86,7 +86,8 @@ class ClipScorer:
         from transformers import CLIPModel, CLIPProcessor
 
         LOG.info("Loading CLIP %s", self.model_id)
-        self._model = CLIPModel.from_pretrained(self.model_id, torch_dtype=self.dtype).to(self.device).eval()
+        model = load_without_empty_weights(lambda **extra: CLIPModel.from_pretrained(self.model_id, torch_dtype=self.dtype, **extra), self.model_id)
+        self._model = model.to(self.device).eval()
         self._processor = CLIPProcessor.from_pretrained(self.model_id)
 
     def to(self, device: str) -> None:
@@ -139,6 +140,14 @@ class ClipScorer:
             rng = IMAGE_COS_RANGE
         raw = (img @ ref.T).squeeze(-1).cpu().numpy()
         return [(_normalize(float(r), rng), float(r)) for r in raw]
+
+    def zero_shot(self, image: Image.Image, labels: Sequence[str]) -> np.ndarray:
+        """Probability of each label for one image (standard CLIP zero-shot classification)."""
+        import torch
+
+        img = self.image_embeddings([image])
+        txt = self.text_embeddings([f"a photo of a {label}" for label in labels])
+        return torch.softmax(100.0 * (img @ txt.T).squeeze(0), dim=-1).cpu().numpy()
 
 
 def score_variations(

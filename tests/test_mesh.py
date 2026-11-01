@@ -1,6 +1,7 @@
 import zipfile
 
 import numpy as np
+import pytest
 import trimesh
 
 from unveil.config import VerifyConfig
@@ -120,3 +121,159 @@ def test_texture_bake_and_textured_export(tmp_path):
     with zipfile.ZipFile(bundle.obj_zip) as zf:
         names = zf.namelist()
     assert any(n.endswith(".mtl") for n in names) and any(n.endswith(".png") for n in names)
+
+
+# ---------------------------------------------------------------------------------------------- hollow / solid
+def _solid_cup():
+    """A closed cylinder with a handle: what TripoSR returns for a mug (no cavity)."""
+    from skimage.measure import marching_cubes
+
+    g = np.linspace(-0.6, 0.6, 96)
+    x, y, z = np.meshgrid(g, g, g, indexing="ij")
+    body = np.minimum(0.3 - np.sqrt(x**2 + z**2), 0.4 - np.abs(y))
+    handle = 0.05 - np.sqrt((np.sqrt((x - 0.32) ** 2 + y**2) - 0.2) ** 2 + z**2)
+    verts, faces, _, _ = marching_cubes(np.maximum(body, handle).astype(np.float32), 0.0, spacing=(g[1] - g[0],) * 3)
+    mesh = trimesh.Trimesh(verts - 0.6, faces, process=False)
+    if signed_volume(mesh.vertices, mesh.faces) < 0:
+        mesh = trimesh.Trimesh(mesh.vertices, mesh.faces[:, ::-1], process=False)
+    return _colored(mesh)
+
+
+def test_voxelize_solid_matches_volume():
+    from unveil.mesh.hollow import voxelize_solid
+
+    box = trimesh.creation.box(extents=(0.4, 0.6, 0.2))
+    pitch = 0.01
+    occ = voxelize_solid(box.vertices, box.faces, np.array([-0.3, -0.4, -0.2]), pitch, (60, 80, 40))
+    assert occ.sum() * pitch**3 == pytest.approx(0.4 * 0.6 * 0.2, rel=0.03)
+
+
+def test_hollow_out_carves_open_cavity_with_walls():
+    from unveil.mesh import hollow_out, section_image
+
+    cup = _solid_cup()
+    result, reason = hollow_out(cup, wall_fraction=0.05, resolution=120)
+    assert result is not None, reason
+    s = result.stats
+    assert s.opened and 0.4 < s.cavity_fraction < 0.9
+    mesh = result.mesh
+    assert mesh.is_watertight and signed_volume(mesh.vertices, mesh.faces) > 0
+    assert signed_volume(mesh.vertices, mesh.faces) < 0.6 * signed_volume(cup.vertices, cup.faces)
+    np.testing.assert_allclose(mesh.extents, cup.extents, atol=0.03)  # outside shape unchanged
+    assert mesh.visual.kind == "vertex"
+
+    # Middle cross-section: material at the walls and the floor, empty in the centre.
+    sec = np.asarray(section_image(mesh.vertices, mesh.faces, size=128).convert("L")) < 200
+    rows, cols = np.nonzero(sec)
+    centre = sec[(rows.min() + rows.max()) // 2, (cols.min() + cols.max()) // 2 - 10]
+    assert not centre and sec.sum() < 0.5 * (np.asarray(section_image(cup.vertices, cup.faces, 128).convert("L")) < 200).sum()
+    # Points on the outer surface keep sampling where they are; cavity points move to the original surface.
+    pts = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.3]])
+    mapped = result.remap(pts)
+    assert np.linalg.norm(mapped[0]) > 0.2 and np.allclose(mapped[1], pts[1])
+
+
+@pytest.mark.parametrize("axis", [(1, 0, 0), (0, 0, 1)])
+def test_hollow_out_opens_tilted_vessel_along_its_own_axis(axis):
+    """A sketch drawn from above makes TripoSR tilt the mug towards the camera: the mouth must still open."""
+    from unveil.mesh import hollow_out
+    from unveil.mesh.hollow import voxelize_solid
+
+    cup = _solid_cup()
+    tilt = trimesh.transformations.rotation_matrix(np.radians(25), axis)
+    cup.apply_transform(tilt)
+    result, reason = hollow_out(cup, wall_fraction=0.05, resolution=120)
+    assert result is not None, reason
+    assert result.stats.opened and result.stats.tilt_deg == pytest.approx(25, abs=2)
+    assert result.stats.mouth_fraction > 0.8
+    upright = result.mesh.copy()
+    upright.apply_transform(np.linalg.inv(tilt))
+    pitch, n = 0.01, 100
+    occ = voxelize_solid(upright.vertices, upright.faces, np.full(3, -0.5), pitch, (n, n, n))
+    c = (np.arange(n) + 0.5) * pitch - 0.5
+    x, z = np.meshgrid(c, c, indexing="ij")
+    inner = x**2 + z**2 < 0.2**2
+    above_floor = occ[:, c > -0.25, :].any(axis=1)
+    assert not above_floor[inner].any()  # looking down the mug's axis, nothing covers the inside
+
+
+# ---------------------------------------------------------------------------------------------- symmetry
+def test_mirror_front_back_keeps_symmetric_object():
+    from unveil.mesh import mirror_front_back
+
+    sphere = _colored(trimesh.creation.icosphere(subdivisions=4, radius=0.4))
+    sphere.apply_translation((0.1, 0.0, 0.13))
+    result, reason = mirror_front_back(sphere)
+    assert result is not None, reason
+    assert result.stats.plane_z == pytest.approx(0.13, abs=0.01)
+    mesh = result.mesh
+    assert mesh.is_watertight and mesh.visual.kind == "vertex"
+    assert signed_volume(mesh.vertices, mesh.faces) == pytest.approx(sphere.volume, rel=0.01)
+    back, front = result.remap(np.array([[0.1, 0.0, -0.1], [0.1, 0.0, 0.3]]))
+    np.testing.assert_allclose(back, [0.1, 0.0, 0.36], atol=0.01)  # behind the plane -> its mirror image
+    np.testing.assert_allclose(front, [0.1, 0.0, 0.3])
+
+
+def test_mirror_front_back_replaces_a_wrong_back():
+    """Front half is a sphere, the guessed back a big box: the box must be replaced by the sphere's mirror."""
+    from skimage.measure import marching_cubes
+
+    from unveil.mesh import mirror_front_back
+
+    g = np.linspace(-0.6, 0.6, 97)
+    x, y, z = np.meshgrid(g, g, g, indexing="ij")
+    sphere = 0.4 - np.sqrt(x**2 + y**2 + z**2)
+    box = np.minimum(np.minimum(0.3 - np.abs(x), 0.3 - np.abs(y)), np.minimum(z + 0.55, -z))
+    verts, faces, _, _ = marching_cubes(np.maximum(sphere, box).astype(np.float32), 0.0, spacing=(g[1] - g[0],) * 3)
+    lump = trimesh.Trimesh(verts - 0.6, faces, process=False)
+    if signed_volume(lump.vertices, lump.faces) < 0:
+        lump = trimesh.Trimesh(lump.vertices, lump.faces[:, ::-1], process=False)
+    result, reason = mirror_front_back(_colored(lump))
+    assert result is not None, reason
+    assert result.stats.plane_z == pytest.approx(0.0, abs=0.03)
+    assert result.mesh.is_watertight
+    assert result.mesh.bounds[0, 2] == pytest.approx(-0.4, abs=0.03)  # was -0.55 (the box)
+    assert result.stats.depth_after < result.stats.depth_before
+
+
+def test_hollow_out_refuses_thin_objects():
+    from unveil.mesh import hollow_out
+
+    plate = _colored(trimesh.creation.box(extents=(0.8, 0.02, 0.8)))
+    result, reason = hollow_out(plate, wall_fraction=0.05, resolution=100)
+    assert result is None and "thin" in reason
+
+
+@pytest.mark.parametrize(
+    "prompt, hollow, label",
+    [
+        ("a glossy red ceramic coffee mug", True, "coffee mug"),
+        ("a glass vase with flowers", True, "vase"),
+        ("a modern table lamp with a white fabric shade", False, "lamp"),
+        ("a lamp with a glass shade", False, "lamp"),
+        ("a wooden dining chair", False, "chair"),
+        ("two bottles of wine", True, "bottle"),
+        ("a wine glass", True, "wine glass"),
+    ],
+)
+def test_interior_from_prompt(prompt, hollow, label):
+    from unveil.mesh import decide_interior
+
+    d = decide_interior(prompt)
+    assert (d.hollow, d.source) == (hollow, "prompt")
+    assert d.label in (label, label.split()[-1])
+
+
+def test_interior_from_clip_and_override():
+    from unveil.mesh import decide_interior
+
+    def bowl_like(labels):
+        p = np.full(len(labels), 0.2 / len(labels))
+        p[labels.index("bowl")] += 0.8
+        return p
+
+    d = decide_interior("", "auto", bowl_like)
+    assert d.hollow and d.source == "clip" and d.label == "bowl" and d.confidence > 0.8
+    assert not decide_interior("a mug", "solid").hollow
+    assert decide_interior("a chair", "hollow").hollow
+    assert not decide_interior("", "auto", None).hollow  # unknown -> solid

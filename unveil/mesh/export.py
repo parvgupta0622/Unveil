@@ -5,7 +5,7 @@ import inspect
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import trimesh
@@ -21,6 +21,7 @@ class ExportBundle:
     depth_scale: float
     textured: bool
     report: dict = field(default_factory=dict)
+    heatmap: Optional[Path] = None  # confidence heatmap OBJ (viewer only, not in the downloads)
 
 
 def _export_obj(mesh: trimesh.Trimesh, obj_path: Path) -> List[Path]:
@@ -64,6 +65,16 @@ def export_asset(asset: MeshAsset, out_dir: Path, depth_scale: float = 1.0, stem
     bundle = ExportBundle(glb_path, obj_path, zip_path, float(depth_scale), final.textured)
     bundle.report = validate_export(bundle, final)
     return bundle
+
+
+def zip_bundles(bundles: List[ExportBundle], zip_path: Path) -> Path:
+    """One archive with every model in every format: <stem>.glb and <stem>_obj/<stem>.obj (+ .mtl / texture)."""
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for b in bundles:
+            zf.write(b.glb, arcname=b.glb.name)
+            for f in sorted(b.obj.parent.iterdir()):
+                zf.write(f, arcname=f"{b.obj.parent.name}/{f.name}")
+    return zip_path
 
 
 def _has_texture(mesh: trimesh.Trimesh) -> bool:

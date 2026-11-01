@@ -8,7 +8,7 @@ import secrets
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 from PIL import Image
@@ -70,6 +70,36 @@ def free_gpu_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def empty_weights(obj: Any) -> List[str]:
+    """Weights a fast (meta-device) checkpoint load left without data. diffusers does this to weights missing
+    from the checkpoint even though it reports them as "newly initialized"; `.to(device)` then fails with
+    "Cannot copy out of meta tensor". `obj` is a model or a diffusers pipeline (all its model components)."""
+    modules = getattr(obj, "components", None)
+    modules = modules.items() if isinstance(modules, dict) else [("", obj)]
+    out = []
+    for prefix, module in modules:
+        if not hasattr(module, "named_parameters"):
+            continue
+        for name, t in list(module.named_parameters()) + list(module.named_buffers()):
+            if t.is_meta:
+                out.append(f"{prefix}.{name}" if prefix else name)
+    return out
+
+
+def load_without_empty_weights(load: Callable[..., Any], what: str) -> Any:
+    """Call `load(**kwargs)`; if it left weights empty, load again with full initialisation (slower, more RAM)."""
+    model = load()
+    empty = empty_weights(model)
+    if empty:
+        LOG.warning(
+            "%s: %d weight(s) are not in the checkpoint for this library version (%s%s); reloading with full "
+            "initialisation so the model can move to the GPU",
+            what, len(empty), ", ".join(empty[:5]), ", ..." if len(empty) > 5 else "",
+        )
+        model = load(low_cpu_mem_usage=False)
+    return model
 
 
 def flatten_alpha(image: Image.Image, background=(255, 255, 255)) -> Image.Image:

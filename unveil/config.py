@@ -38,6 +38,10 @@ CONTROL_MODES = {
 DEPTH_PRESETS = {"Thin": 0.5, "Medium": 1.0, "Thick": 1.6}
 DEPTH_RANGE = (0.3, 2.5)
 
+# "auto" decides from the object category (prompt keywords, else CLIP zero-shot); see mesh/hollow.py.
+INTERIOR_MODES = ("auto", "hollow", "solid")
+WALL_RANGE = (0.02, 0.10)  # wall thickness as a fraction of the object's largest dimension
+
 
 @dataclass
 class GenerationConfig:
@@ -89,6 +93,25 @@ class MeshConfig:
 
 
 @dataclass
+class HollowConfig:
+    wall_fraction: float = 0.05
+    voxel_resolution: int = 160  # voxels along the object's largest dimension (TripoSR's own grid is ~170)
+    max_outputs: int = 2  # final 3D models per build (one per selected variation)
+
+
+@dataclass
+class GuideConfig:
+    resolution: int = 192  # voxels along the object's largest dimension when trimming to guide views
+    tolerance: float = 0.03  # leeway around a guide outline (x its size) before anything is cut
+
+
+@dataclass
+class CadConfig:
+    resolution: int = 192  # voxels along the part's largest dimension (CAD drawing -> 3D)
+    max_faces: int = 40_000  # marching cubes over-tessellates flat faces; decimate down to this
+
+
+@dataclass
 class VerifyConfig:
     render_size: int = 256
     w_iou: float = 0.5
@@ -106,6 +129,9 @@ class UnveilConfig:
     reconstruction: ReconstructionConfig = field(default_factory=ReconstructionConfig)
     mesh: MeshConfig = field(default_factory=MeshConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
+    hollow: HollowConfig = field(default_factory=HollowConfig)
+    cad: CadConfig = field(default_factory=CadConfig)
+    guide: GuideConfig = field(default_factory=GuideConfig)
     rembg_model: str = "u2net"
     device: str = "auto"
     # None = decide from available VRAM (offload idle models to CPU on GPUs with < 13 GB).
