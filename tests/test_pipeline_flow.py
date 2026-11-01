@@ -21,7 +21,7 @@ from tests.conftest import draw_outline  # noqa: E402
 from unveil.background import composite_on, resize_foreground  # noqa: E402
 from unveil.config import UnveilConfig  # noqa: E402
 from unveil.mesh.hollow import HOLLOW_OBJECTS, SOLID_OBJECTS  # noqa: E402
-from unveil.pipeline import ImageRun, PipelineError, RunOptions, RunResult, StageEvent, UnveilPipeline  # noqa: E402
+from unveil.pipeline import GuideViews, ImageRun, PipelineError, RunOptions, RunResult, StageEvent, UnveilPipeline  # noqa: E402
 from unveil.reconstruction.base import CameraSpec, ReconstructionResult, Reconstructor  # noqa: E402
 
 
@@ -205,6 +205,35 @@ def test_front_back_symmetry_with_hollow_and_bake(pipe):
     assert o.symmetry is not None and o.hollow is not None
     assert o.bundle.textured and o.bundle.report["passed"], o.bundle.report["checks"]
     assert result.summary["outputs"][0]["symmetry"]["plane_z"] == pytest.approx(0.0, abs=0.03)  # slab centred on z = 0
+
+
+def _side_sketch(depth_ratio):
+    """A side view as a user would draw it: a rectangle outline as tall as the object and `depth_ratio` x as deep."""
+    img = np.full((512, 512), 255, np.uint8)
+    h = 330
+    cv2.rectangle(img, (100, 90), (100 + int(h * depth_ratio), 90 + h), 0, 4)
+    return Image.fromarray(img)
+
+
+def test_side_view_guide_trims_depth_and_heatmap_is_exported(pipe):
+    _, plain = _run(pipe, bake_texture=False, top_k_images=1)
+    assert plain.outputs[0].guide is None and plain.outputs[0].confidence is not None
+    assert plain.outputs[0].bundle.heatmap.exists()  # every sketch run gets a confidence heatmap
+    events = list(pipe.run(draw_outline("L"), RunOptions(texture_resolution=256, top_k_images=1), GuideViews(side=_side_sketch(0.15))))
+    result = events[-1]
+    o = result.outputs[0]
+    assert o.guide is not None and o.guide.views == ["side"] and o.guide.trimmed_fraction > 0.2
+    assert o.guide.depth_after < 0.7 * o.guide.depth_before
+    assert o.bundle.report["passed"], o.bundle.report["checks"]
+    assert o.bundle.textured  # colours are still baked from TripoSR's field after trimming
+    assert o.confidence.guided > 0.2 and o.bundle.heatmap.exists()
+    assert any("side view guide" in caption for _, caption in result.candidate_gallery)
+    assert result.summary["outputs"][0]["guide"]["views"] == ["side"] and result.summary["guide_views"]["given"] == ["side"]
+    thin, _ = pipe.reexport(result.build_dir, 0.5)  # the heatmap follows a depth change
+    assert thin[0].heatmap is not None and "depth0.50" in thin[0].heatmap.name and thin[0].heatmap.exists()
+    with pytest.raises(PipelineError) as err:  # a blank guide canvas that slipped through fails before TripoSR
+        list(pipe.run_3d(result.run_id, [0], guides=GuideViews(top=Image.new("RGB", (256, 256), "white"))))
+    assert err.value.stage == "interior" and "top-view sketch" in str(err.value)
 
 
 def test_cad_drawing_run(pipe, tmp_path):

@@ -26,22 +26,30 @@ from .generation import SketchImageGenerator, Variation, build_prompt
 from .mesh import (
     CandidateScore,
     CleanStats,
+    ConfidenceField,
+    ConfidenceStats,
     ExportBundle,
+    GuideStats,
     HollowStats,
     InteriorDecision,
     MeshAsset,
     MeshError,
     SymmetryStats,
+    apply_guides,
     bake_texture,
     clean_mesh,
     decide_interior,
     decimate,
     export_asset,
+    export_heatmap,
     hollow_out,
     mirror_front_back,
+    save_confidence,
     score_candidate,
     section_image,
+    see_through_holes,
     smooth_mesh,
+    surface_confidence,
     zip_bundles,
 )
 from .preprocess import SketchError, SketchPrep, preprocess_sketch
@@ -54,7 +62,7 @@ STAGES: List[Tuple[str, str]] = [
     ("generate", "ControlNet variations"),
     ("select_image", "Variation scoring & selection"),
     ("reconstruct", "TripoSR candidates & verification"),
-    ("interior", "Symmetry & hollow / solid interior"),
+    ("interior", "Guides, symmetry & hollow / solid interior"),
     ("refine", "Mesh refinement & texture"),
     ("export", "Export & validation"),
 ]
@@ -93,6 +101,20 @@ class RunOptions:
     interior: str = "auto"  # auto | hollow | solid
     wall_thickness: float = 0.05  # fraction of the object's largest dimension
     front_back_symmetric: bool = False  # rebuild the hidden back as a mirror image of the visible front
+    open_holes: bool = True  # drill gaps that are see-through in the image and drawn as a loop in the sketch
+
+
+@dataclass
+class GuideViews:
+    """Optional extra sketches that trim TripoSR's guess (see mesh/guide.py)."""
+
+    side: Optional[Image.Image] = None  # the object seen from its side
+    top: Optional[Image.Image] = None  # seen from above, its front at the bottom of the sheet
+    side_front: str = "left"  # which way the object's front faces in the side sketch
+
+    @property
+    def given(self) -> List[str]:
+        return [name for name in ("side", "top") if getattr(self, name) is not None]
 
 
 @dataclass
@@ -174,6 +196,8 @@ class FinalOutput:
     section: Image.Image
     score: CandidateScore
     symmetry: Optional[SymmetryStats] = None
+    guide: Optional[GuideStats] = None
+    confidence: Optional[ConfidenceStats] = None
 
     def summary(self) -> dict:
         return {
@@ -185,6 +209,8 @@ class FinalOutput:
             "interior": asdict(self.interior),
             "hollow": asdict(self.hollow) if self.hollow else None,
             "symmetry": asdict(self.symmetry) if self.symmetry else None,
+            "guide": asdict(self.guide) if self.guide else None,
+            "confidence": asdict(self.confidence) if self.confidence else None,
             "validation_passed": self.bundle.report.get("passed"),
         }
 
@@ -299,15 +325,15 @@ class UnveilPipeline:
             cache.popitem(last=False)
 
     # ------------------------------------------------------------------ entry points
-    def run(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, RunResult]]:
+    def run(self, sketch: Image.Image, opts: RunOptions, guides: Optional[GuideViews] = None) -> Iterator[Union[StageEvent, RunResult]]:
         """Full automatic run: images, then 3D from the top-ranked `opts.top_k_images` variations."""
-        yield from self._guard(self._run(sketch, opts), "preprocess")
+        yield from self._guard(self._run(sketch, opts, guides), "preprocess")
 
     def run_images(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, ImageRun]]:
         """Image phase only; finishes with an `ImageRun` whose variations the user can choose from."""
         yield from self._guard(self._images(sketch, opts), "preprocess")
 
-    def run_3d(self, run_id: str, selection: List[int], opts: Optional[RunOptions] = None) -> Iterator[Union[StageEvent, RunResult]]:
+    def run_3d(self, run_id: str, selection: List[int], opts: Optional[RunOptions] = None, guides: Optional[GuideViews] = None) -> Iterator[Union[StageEvent, RunResult]]:
         """3D phase for user-chosen variation indices of an earlier `run_images()`/`run()`."""
         img = self._image_runs.get(run_id)
         if img is None:
@@ -315,7 +341,7 @@ class UnveilPipeline:
         if opts is not None:  # the 3D settings may change between builds; the image settings may not
             keep = ("prompt", "negative_prompt", "control_mode", "seed", "num_variations", "steps", "guidance_scale")
             opts = replace(opts, **{k: getattr(img.opts, k) for k in keep})
-        yield from self._guard(self._models(img, selection, opts or img.opts, "user"), "reconstruct")
+        yield from self._guard(self._models(img, selection, opts or img.opts, "user", guides), "reconstruct")
 
     def run_cad(self, path: Path, depth_scale: float = 1.0) -> Iterator[Union[StageEvent, CadRun]]:
         """Solid from a DXF/DWG with front, top and side views (see unveil/cad.py)."""
@@ -338,14 +364,14 @@ class UnveilPipeline:
             LOG.exception("Stage %s failed", stage)
             raise PipelineError(stage, f"{type(exc).__name__}: {exc}") from exc
 
-    def _run(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, RunResult]]:
+    def _run(self, sketch: Image.Image, opts: RunOptions, guides: Optional[GuideViews] = None) -> Iterator[Union[StageEvent, RunResult]]:
         img = None
         for event in self._images(sketch, opts):
             if isinstance(event, ImageRun):
                 img = event
             else:
                 yield event
-        yield from self._models(img, img.auto_selection(opts.top_k_images), opts, "auto")
+        yield from self._models(img, img.auto_selection(opts.top_k_images), opts, "auto", guides)
 
     # ------------------------------------------------------------------ phase 1: images
     def _images(self, sketch: Image.Image, opts: RunOptions) -> Iterator[Union[StageEvent, ImageRun]]:
@@ -413,7 +439,7 @@ class UnveilPipeline:
         yield img_run
 
     # ------------------------------------------------------------------ phase 2: 3D
-    def _models(self, img: ImageRun, selection: List[int], opts: RunOptions, selected_by: str) -> Iterator[Union[StageEvent, RunResult]]:
+    def _models(self, img: ImageRun, selection: List[int], opts: RunOptions, selected_by: str, guides: Optional[GuideViews] = None) -> Iterator[Union[StageEvent, RunResult]]:
         selection = list(dict.fromkeys(int(i) for i in selection))
         limit = self.cfg.hollow.max_outputs
         if not selection or any(not 0 <= i < len(img.variations) for i in selection):
@@ -421,6 +447,8 @@ class UnveilPipeline:
         if len(selection) > limit:
             raise PipelineError("reconstruct", f"Choose at most {limit} variations (each one becomes a final 3D model).")
         variations, prep = img.variations, img.prep
+        guides = guides or GuideViews()
+        guide_masks = _guide_masks(guides)  # read the guide sketches first: a bad one fails before TripoSR runs
         warnings = list(img.warnings)
         timer = StageTimer()
         build_dir = img.run_dir / ("3d_v" + "-".join(str(i + 1) for i in selection))
@@ -472,13 +500,40 @@ class UnveilPipeline:
                 candidate_gallery.append((Image.new("RGB", (512, 256), (245, 245, 245)), f"#{c.index + 1} failed: {c.error}"))
         yield StageEvent("reconstruct", "done", "Best: " + ", ".join(f"candidate #{f.index + 1}" for f in finals), payload={"candidates": candidate_gallery})
 
-        # 5. Shape: optional front-back mirror, then hollow vessels get a real cavity --------
-        yield StageEvent("interior", "start", "Mirroring the front onto the back" if opts.front_back_symmetric else "Deciding hollow vs solid")
+        # 5. Shape: guide views / see-through holes trim TripoSR's guess, an optional front-back mirror, then
+        #    vessels get a real cavity. The confidence map is measured on the trimmed mesh, before mirroring.
+        first = "Fitting your guide views" if guide_masks else ("Mirroring the front onto the back" if opts.front_back_symmetric else "Deciding hollow vs solid")
+        yield StageEvent("interior", "start", first)
         shaped = []  # (candidate, mesh, decision, hollow stats, colour-query remap)
         symmetry: Dict[int, SymmetryStats] = {}
+        guided: Dict[int, GuideStats] = {}
+        confidence: Dict[int, ConfidenceField] = {}
+        overlays = 0
         with timer("interior"):
             for slot, c in enumerate(finals):
-                mesh, stats, remap = c.mesh, None, None
+                mesh, stats, remap, pinned = c.mesh, None, None, None
+                holes = see_through_holes(np.asarray(img.rgbas[c.variation])[..., 3], prep.ink) if opts.open_holes else None
+                if holes is not None and not holes[0].any():
+                    holes = None
+                if guide_masks or holes is not None:
+                    yield StageEvent("interior", "progress", f"Model {slot + 1}: " + ("trimming to your guide views" if guide_masks else "opening see-through holes"), fraction=slot / len(finals))
+                    fitted, reason = apply_guides(
+                        mesh, self.reconstructor.camera, holes, guide_masks.get("side"), guide_masks.get("top"), guides.side_front != "right",
+                        self.cfg.guide.resolution, self.cfg.guide.tolerance, min(opts.smooth_iterations, 3),
+                    )
+                    if fitted is None:
+                        if reason:
+                            warnings.append(f"Model {slot + 1}: guide views not applied ({reason}).")
+                    else:
+                        mesh, pinned, guided[slot] = fitted.mesh, fitted.pinned, fitted.stats
+                        candidate_gallery += [(im, f"Model {slot + 1} · {caption}") for im, caption in fitted.overlays]
+                        overlays += len(fitted.overlays)
+                try:
+                    others = [o.mesh for o in candidates if o.ok and o.index != c.index]
+                    confidence[slot] = surface_confidence(mesh, c.mesh, others, self.reconstructor.camera, pinned)
+                except Exception as exc:  # noqa: BLE001 - the heatmap is an extra: never lose the model over it
+                    LOG.exception("Confidence map failed")
+                    warnings.append(f"Model {slot + 1}: no confidence heatmap ({type(exc).__name__}: {exc}).")
                 if opts.front_back_symmetric:
                     yield StageEvent("interior", "progress", f"Model {slot + 1}: rebuilding the back as a mirror of the front", fraction=slot / len(finals))
                     mirrored, reason = mirror_front_back(mesh)
@@ -502,7 +557,11 @@ class UnveilPipeline:
                         mesh, stats = hollowed.mesh, hollowed.stats
                         remap = hollowed.remap if outer is None else (lambda pts, h=hollowed.remap, o=outer: o(h(pts)))
                 shaped.append((c, mesh, decision, stats, remap))
-        yield StageEvent("interior", "done", " · ".join(f"Model {i + 1}: {'mirrored, ' if i in symmetry else ''}{'hollow' if s else 'solid'}" for i, (_, _, _, s, _) in enumerate(shaped)))
+        if overlays:
+            yield StageEvent("interior", "progress", payload={"candidates": candidate_gallery})
+        yield StageEvent("interior", "done", " · ".join(
+            f"Model {i + 1}: {('fitted to guides, ' if guided[i].views else 'holes opened, ') if i in guided else ''}{'mirrored, ' if i in symmetry else ''}{'hollow' if s else 'solid'}" for i, (_, _, _, s, _) in enumerate(shaped)
+        ))
 
         # 6. Refine: decimate + optional UV texture bake ----------------------------------
         yield StageEvent("refine", "start", "Baking UV textures" if opts.bake_texture else "Finalising meshes (vertex colours)")
@@ -515,6 +574,9 @@ class UnveilPipeline:
                     asset = self._bake(asset, c.handle, opts.texture_resolution, warnings, remap)
                 asset_path = build_dir / f"model{slot + 1}_{variations[c.variation].level.name}.npz"
                 asset.save(asset_path)
+                if slot in confidence:  # stored by position, so it survives a later bake that re-indexes vertices
+                    points = asset.vertices.astype(np.float64)
+                    save_confidence(_confidence_path(asset_path), points, confidence[slot].at(remap(points) if remap else points))
                 self._remember(self._handles, str(asset_path), (c.handle, remap), 8)
                 assets.append((asset_path, asset))
         for c in candidates:  # release candidate meshes/handles we no longer need
@@ -526,10 +588,12 @@ class UnveilPipeline:
         outputs: List[FinalOutput] = []
         with timer("export"):
             for slot, ((asset_path, asset), (c, _, decision, stats, _)) in enumerate(zip(assets, shaped)):
-                bundle = export_asset(asset, build_dir, opts.depth_scale, asset_path.stem)
+                bundle = _export(asset, asset_path, opts.depth_scale)
                 section = section_image(asset.vertices, asset.faces)
                 section.save(build_dir / f"{asset_path.stem}_section.png")
-                outputs.append(FinalOutput(slot, c.variation, variations[c.variation].level.name, c.index, asset_path, bundle, decision, stats, section, c.score, symmetry.get(slot)))
+                conf = confidence.get(slot)
+                outputs.append(FinalOutput(slot, c.variation, variations[c.variation].level.name, c.index, asset_path, bundle, decision, stats, section, c.score,
+                                           symmetry.get(slot), guided.get(slot), conf.stats if conf else None))
                 if not bundle.report["passed"]:
                     warnings.append(f"Model {slot + 1}: some export validation checks failed - see its validation report.")
             all_zip = zip_bundles([o.bundle for o in outputs], build_dir / f"unveil_{img.run_id}_all_depth{opts.depth_scale:.2f}.zip")
@@ -552,6 +616,7 @@ class UnveilPipeline:
             "variations": img.score_rows(),
             "variation_ranking": img.ranking,
             "selection": {"variations": selection, "selected_by": selected_by},
+            "guide_views": {"given": guides.given, "side_front": guides.side_front},
             "candidates": [c.summary() for c in candidates],
             "outputs": [o.summary() for o in outputs],
             "timings_s": dict(timings, total=round(sum(timings.values()), 3)),
@@ -640,7 +705,7 @@ class UnveilPipeline:
     def reexport(self, build_dir: Path, depth_scale: float) -> Tuple[List[ExportBundle], Path]:
         """Re-export every model of a build with a new depth scale (geometry change, no re-inference)."""
         build_dir = Path(build_dir)
-        bundles = [export_asset(MeshAsset.load(p), build_dir, depth_scale, p.stem) for p in self._build_assets(build_dir)]
+        bundles = [_export(MeshAsset.load(p), p, depth_scale) for p in self._build_assets(build_dir)]
         return bundles, zip_bundles(bundles, build_dir / f"unveil_{build_dir.parent.name}_all_depth{depth_scale:.2f}.zip")
 
     def bake_existing(self, build_dir: Path, depth_scale: float, resolution: int = 1024) -> Tuple[List[ExportBundle], Path, List[str]]:
@@ -656,6 +721,28 @@ class UnveilPipeline:
             asset.save(asset_path)
         bundles, all_zip = self.reexport(build_dir, depth_scale)
         return bundles, all_zip, warnings
+
+
+def _confidence_path(asset_path: Path) -> Path:
+    return asset_path.parent / f"confidence_{asset_path.stem}.npz"  # not "model*.npz": that pattern lists the models
+
+
+def _export(asset: MeshAsset, asset_path: Path, depth_scale: float) -> ExportBundle:
+    """GLB/OBJ export plus the confidence heatmap OBJ when the model has a confidence map."""
+    bundle = export_asset(asset, asset_path.parent, depth_scale, asset_path.stem)
+    bundle.heatmap = export_heatmap(asset, _confidence_path(asset_path), asset_path.parent / f"{bundle.glb.stem}_confidence.obj", depth_scale)
+    return bundle
+
+
+def _guide_masks(guides: GuideViews) -> Dict[str, np.ndarray]:
+    """Filled silhouettes of the guide sketches."""
+    masks = {}
+    for name in guides.given:
+        try:
+            masks[name] = preprocess_sketch(getattr(guides, name), size=256).silhouette
+        except SketchError as exc:
+            raise PipelineError("interior", f"The {name}-view sketch could not be read: {exc}") from exc
+    return masks
 
 
 def _side_by_side(left: Optional[Image.Image], right: Image.Image) -> Image.Image:

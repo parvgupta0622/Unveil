@@ -86,3 +86,64 @@ def plate_with_boss(path: Path) -> float:
     _poly(msp, [(110, 0), (160, 0), (160, 10), (145, 10), (145, 25), (125, 25), (125, 10), (110, 10)])
     doc.saveas(path)
     return 80 * 50 * 10 + math.pi * 10**2 * 15
+
+
+def pillow_block(path: Path) -> float:
+    """Third-angle pillow block drawn like an AutoCAD sheet: OBJECT / HIDDEN / CENTER / DIM / TITLE / BORDER layers
+    with BYLAYER linetypes, dimensions, centre lines and a title block. Base 120 x 50 x 15 with two 12 mm bolt
+    holes through it; a 60 wide housing with a round top (R30 about x=60, z=45), a 30 mm bore front to back and a
+    6 mm grease hole from the top down into the bore."""
+    doc, msp = _new()
+    doc.layers.add("OBJECT", color=7)
+    doc.layers.add("HIDDEN", color=1, linetype="HIDDEN")
+    doc.layers.add("CENTER", color=3, linetype="CENTER")
+    doc.layers.add("DIM", color=4)
+    doc.layers.add("TITLE", color=7)
+    obj, hid, cen, dim = ({"layer": n} for n in ("OBJECT", "HIDDEN", "CENTER", "DIM"))
+    top_z = 45 + math.sqrt(30**2 - 3**2)  # the arch's height at the grease hole's edge
+
+    # Front (x, z): base plus an arched housing, the bore seen end-on.
+    msp.add_lwpolyline([(0, 0, 0), (120, 0, 0), (120, 15, 0), (90, 15, 0), (90, 45, 1), (30, 45, 0), (30, 15, 0), (0, 15, 0)],
+                       format="xyb", close=True, dxfattribs=obj)
+    msp.add_circle((60, 45), 15, dxfattribs=obj)
+    for x in (9, 21, 99, 111):  # bolt holes
+        msp.add_line((x, 0), (x, 15), dxfattribs=hid)
+    for x in (57, 63):  # grease hole
+        msp.add_line((x, 60), (x, top_z), dxfattribs=hid)
+    msp.add_line((40, 45), (80, 45), dxfattribs=cen)
+    msp.add_line((60, 25), (60, 82), dxfattribs=cen)
+
+    # Top (x, y) above the front: sheet y = 110 + y.
+    msp.add_lwpolyline([(0, 110), (120, 110), (120, 160), (0, 160)], close=True, dxfattribs=obj)
+    msp.add_line((30, 110), (30, 160), dxfattribs=obj)
+    msp.add_line((90, 110), (90, 160), dxfattribs=obj)
+    for x, r in ((15, 6), (105, 6), (60, 3)):
+        msp.add_circle((x, 135), r, dxfattribs=obj)
+        msp.add_line((x - r - 4, 135), (x + r + 4, 135), dxfattribs=cen)
+    for x in (45, 75):  # bore
+        msp.add_line((x, 110), (x, 160), dxfattribs=hid)
+
+    # Right side (y, z) right of the front: sheet x = 150 + y.
+    msp.add_lwpolyline([(150, 0), (200, 0), (200, 75), (150, 75)], close=True, dxfattribs=obj)
+    msp.add_line((150, 15), (200, 15), dxfattribs=obj)
+    for z in (30, 60):  # bore
+        msp.add_line((150, z), (200, z), dxfattribs=hid)
+    for y in (19, 31):  # bolt holes (both behind each other)
+        msp.add_line((150 + y, 0), (150 + y, 15), dxfattribs=hid)
+    for y in (22, 28):  # grease hole
+        msp.add_line((150 + y, 60), (150 + y, 75), dxfattribs=hid)
+    msp.add_line((145, 45), (205, 45), dxfattribs=cen)
+
+    # Sheet furniture the reader must ignore.
+    msp.add_linear_dim(base=(0, -15), p1=(0, 0), p2=(120, 0), dxfattribs=dim).render()
+    msp.add_linear_dim(base=(-15, 0), p1=(0, 0), p2=(0, 15), angle=90, dxfattribs=dim).render()
+    msp.add_linear_dim(base=(215, 0), p1=(200, 0), p2=(200, 75), angle=90, dxfattribs=dim).render()
+    msp.add_diameter_dim(center=(60, 45), radius=15, angle=45, dxfattribs=dim).render()
+    msp.add_lwpolyline([(-40, -50), (280, -50), (280, 200), (-40, 200)], close=True, dxfattribs={"layer": "BORDER"})
+    msp.add_lwpolyline([(160, -50), (280, -50), (280, -20), (160, -20)], close=True, dxfattribs={"layer": "TITLE"})
+    msp.add_text("PILLOW BLOCK", dxfattribs={"layer": "TITLE", "height": 6}).set_placement((165, -32))
+    msp.add_text("MS  1:1  mm  3rd ANGLE", dxfattribs={"layer": "TITLE", "height": 3.5}).set_placement((165, -44))
+    doc.saveas(path)
+
+    housing = 60 * 30 * 50 + math.pi * 30**2 / 2 * 50
+    return 120 * 50 * 15 + housing - math.pi * 15**2 * 50 - 2 * math.pi * 6**2 * 15 - math.pi * 3**2 * (top_z - 60)

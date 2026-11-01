@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("ezdxf")
 
-from .cad_drawings import back_wall_first_angle, cylinder, l_bracket, plate_with_boss  # noqa: E402
+from .cad_drawings import back_wall_first_angle, cylinder, l_bracket, pillow_block, plate_with_boss  # noqa: E402
 
 from unveil.cad import CadError, cad_to_model  # noqa: E402
 from unveil.mesh.processing import signed_volume  # noqa: E402
@@ -59,6 +59,20 @@ def test_cylinder_and_boss_without_hidden_lines_stay_solid(tmp_path):
     boss = cad_to_model(boss_path)
     assert not boss.holes and _volume(boss) == pytest.approx(expected, rel=0.04)
     assert any("hidden" in w for w in boss.warnings)
+
+
+def test_pillow_block_sheet_with_dimensions_and_title_block(tmp_path):
+    """BYLAYER hidden / centre linetypes, dimensions, border and title block; a through bore, two bolt holes and
+    a blind grease hole that stops at the bore."""
+    path = tmp_path / "pillow.dxf"
+    expected = pillow_block(path)
+    model = cad_to_model(path)
+    assert model.projection == "third-angle" and model.view_source == "layout" and not model.warnings
+    np.testing.assert_allclose(model.dimensions, (120, 50, 75), rtol=0.01)
+    depths = sorted((h.view, h.evidence, round(h.depth_range[0]), round(h.depth_range[1])) for h in model.holes)
+    assert depths == [("front", "top", 0, 50), ("top", "front", 0, 15), ("top", "front", 0, 15), ("top", "front", 60, 75)]
+    assert model.mesh.is_watertight
+    assert _volume(model) == pytest.approx(expected, rel=0.03)
 
 
 def test_unusable_drawings_give_clear_errors(tmp_path):

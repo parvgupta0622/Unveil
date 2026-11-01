@@ -6,8 +6,8 @@ coloured, exportable 3D model (**GLB** and **OBJ+MTL+PNG**). It runs on a **free
 ```
 sketch ─► preprocessing ─► SD1.5 + ControlNet ×4 creativity levels ─► score & pick (IoU + CLIP + clean-bg)
        ─► background removal ─► TripoSR ×4 candidates ─► largest component + smoothing
-       ─► reproject & verify vs. sketch ─► best mesh per chosen image ─► optional front-back mirror
-       ─► hollow vessels / keep solids ─► UV texture bake ─► depth (Z) scaling ─► GLB/OBJ for every model ─► re-open & validate
+       ─► reproject & verify vs. sketch ─► best mesh per chosen image ─► trim to optional side/top sketches
+       + open see-through holes ─► confidence map ─► optional front-back mirror ─► hollow vessels / keep solids ─► UV texture bake ─► depth (Z) scaling ─► GLB/OBJ for every model ─► re-open & validate
 ```
 
 The two best ControlNet images (or the one or two **you** pick) each become a final 3D model, so every run ends
@@ -63,13 +63,15 @@ No Hugging Face token is needed: every model is public and ungated.
    - **Freeform**: scribble ControlNet; tolerant of rough, wobbly or open strokes.
 4. **Interior.** *Auto-detect* (default) hollows vessels such as cups, mugs, bowls, bottles, vases and jars, and keeps everything else solid (§4.4). *Hollow* / *Solid* force either. **Wall thickness** is a fraction of the object's largest dimension (default 5 %).
    **Front-back symmetric** (default off): tick it when the object looks the same from behind (a vase, a mug or a car seen side-on). The hidden back is then rebuilt as a mirror image of the visible front instead of TripoSR's guess (§4.5).
+   **Open see-through holes** (default on): a gap you drew as a closed loop (a mug handle's opening) that the generated image also shows as see-through is cut through the model, even if TripoSR filled it in (§4.7).
+   **Side / top view (optional)**, under your sketch: draw the object's outline from the side and/or from above, and the model is trimmed to fit it. This fixes depth TripoSR got wrong; nothing is added and the front is kept (§4.7).
 5. **Bake UV texture** (default on): bakes a UV texture so colour survives in OBJ and in every DCC tool. Turn it off for faster vertex-colour output; you can still bake later with the *Bake UV textures for these models* button.
 6. Press **✨ Generate 3D** (fully automatic), or **🖼️ Images first — I'll pick** to stop after the ControlNet images and choose yourself. A progress bar with one pill per stage (timings included) stays pinned to the top of the window while the run is going.
 7. **Follow the pipeline.** The page is one column: **① Settings** and **② Your sketch** on top, then each result section appears below as soon as it has something to show (nothing is shown as an empty placeholder), and the page scrolls to it unless you are scrolling yourself:
    - **③ Sketch preprocessing:** input, cleaned strokes, ControlNet conditioning image, filled silhouette. (For a CAD drawing: **③ Drawing analysis**, then straight to ⑥.)
    - **④ ControlNet variations:** all four images, a score table (rank, IoU, CLIP, clean, total, structure check) and an explanation of how the best one is chosen. **Tick one or two variations and press *Build 3D from selected*** to (re)build the 3D models from them. This reuses the images; only the 3D stages run again.
-   - **⑤ TripoSR candidates:** for every candidate, the TripoSR input next to its reprojection overlay (blue = mesh, red = sketch outline, ★ = became a final model).
-   - **⑥ Final 3D models:** one card per model with the exported **OBJ rendered live** (three.js: drag to turn it in any direction, click then scroll to zoom, right-drag to pan, auto-spin / reset / wireframe buttons), the symmetry and hollow/solid results, a **cross-section** cut through the middle (shows walls and cavity), downloads and the export validation report.
+   - **⑤ TripoSR candidates:** for every candidate, the TripoSR input next to its reprojection overlay (blue = mesh, red = sketch outline, ★ = became a final model). With guide views, one more image per model shows how its profile was trimmed (light blue = TripoSR, dark blue = after, red = your outline).
+   - **⑥ Final 3D models:** one card per model with the exported **OBJ rendered live** (three.js: drag to turn it in any direction, click then scroll to zoom, right-drag to pan, auto-spin / reset / wireframe buttons), the guide, symmetry, hollow/solid and confidence results, a **🌡 Confidence** button that recolours the model green (sure) → yellow → red (guessed) (§4.8), a **cross-section** cut through the middle (shows walls and cavity), downloads and the export validation report.
 8. **Depth.** Choose *Thin / Medium / Thick* or drag the slider (0.3×–2.5×). This **rescales the real geometry** of every model along the view axis and **re-exports** all files, with the validation reports refreshed. No re-inference is needed.
 9. **Errors** appear once, in a single popup naming the stage that failed; the progress bar marks that stage red. Your inputs and settings stay as they were.
 10. **Download.** Each model card offers its `.glb` and its OBJ zip (`.obj` + `.mtl` + texture `.png`). **📦 Everything** is one zip with every model in every format.
@@ -86,6 +88,8 @@ The *Advanced settings* panel exposes the seed, number of variations (3–4), di
 | Foreground isolation | `unveil/background.py` | rembg (U²-Net), alpha-island cleanup, and a border-colour-keying fallback if rembg is unavailable. TripoSR framing (foreground ratio, 50 % grey). |
 | Image → 3D | `unveil/reconstruction/` | `Reconstructor` interface + registry. **TripoSR** is the only backend. Meshes are returned in a shared *view frame* (+x right, +y up, +z towards the camera). |
 | Mesh processing | `unveil/mesh/processing.py` | Weld, drop degenerate faces, **keep the largest connected component**, fix winding (signed volume), Taubin smoothing, quadric decimation (> 120 k faces). |
+| Guide views & holes | `unveil/mesh/guide.py` | Optional side/top sketches → silhouettes registered to the mesh by its front profile → voxel trim; see-through holes (image background ∩ sketch loop) drilled along the camera rays (§4.7). |
+| Confidence map | `unveil/mesh/confidence.py` | Agreement between the TripoSR attempts + visibility from the input camera (+ guide outlines) → per-point confidence, exported as a vertex-coloured heatmap OBJ for the viewer (§4.8). |
 | Front-back symmetry | `unveil/mesh/symmetry.py` | Optional: finds the mirror plane facing the camera, clips the mesh there, and replaces the back half with a reflection of the front (§4.5). |
 | Hollow / solid | `unveil/mesh/hollow.py` | Object category from the prompt (or CLIP zero-shot) → hollow or solid. Vessels are aligned to their own axis, voxelised, eroded by the wall thickness, drilled open at the rim and re-meshed (§4.4). Also renders the cross-section previews. |
 | Verification | `unveil/mesh/verify.py` | Perspective reprojection into TripoSR's input camera, silhouette IoU + edge chamfer vs. the sketch, floater penalty, validity checks. |
@@ -142,7 +146,7 @@ A single image only shows the front; TripoSR guesses the back. When **Front-back
 It runs before hollowing, so a symmetric mug is also hollowed. The model card shows the depth before and after. It only handles symmetry front-to-back (the back mirrors the front), not left-right or rotational.
 
 ### 4.6 CAD drawing → 3D (proof of concept)
-The **📐 CAD drawing** tab builds a solid from a classic three-view drawing, without any neural network (about 1–2 s). Two examples are bundled in `examples/`.
+The **📐 CAD drawing** tab builds a solid from a classic three-view drawing, without any neural network (about 1–2 s). Two examples appear in the tab; `examples/pillow_block.dxf` is a third, harder one kept out of the tab (dimensions, centre lines, title block, a blind hole) to try as an unseen drawing.
 
 **What the drawing should look like (the "hard-coded" format):**
 - One part, drawn as **front, top and side views** in model space; no border or title block (or put those on layers named BORDER / TITLE / DIM…, which are ignored).
@@ -158,6 +162,26 @@ The **📐 CAD drawing** tab builds a solid from a classic three-view drawing, w
 **DWG** is a closed binary format. Unveil converts it to DXF with GNU LibreDWG's `dwg2dxf` (Colab cell 3b builds it), or with the ODA File Converter if that is installed. Tested with DWG versions R13–2018.
 
 **Limits:** shapes a three-outline intersection cannot express come out approximated: a sphere becomes the intersection of three cylinders, a cone seen from the side gets flat facets, and pockets or slots that show only as hidden lines are not cut unless they are closed shapes in another view. Auxiliary/inclined views, sections, and multiple parts per drawing are not supported.
+
+### 4.7 Guide views and see-through holes
+TripoSR sees only the front, so two things go wrong often: the **depth/back is guessed** (too fat, too thin, a lump behind), and **gaps get filled** (the opening of a mug handle becomes a membrane). Extra evidence fixes both, used as a scaffold around TripoSR's mesh rather than a replacement for it:
+
+- **Side / top sketches.** Each one is preprocessed like the main sketch and filled into a silhouette, then pushed through the mesh like a cookie cutter (side view along x, top view along y). Material outside it is cut off; nothing is added, so TripoSR's detail and colour are kept wherever it agrees.
+  - *Registration:* the front view is the part TripoSR got right, so it anchors the guide. The side sketch is scaled by the object's **height** and the top sketch by its **width**; the depth position comes from matching the sketch's front edge to the mesh's front surface, row by row (median). Sizes and positions therefore never need to match your main drawing.
+  - *Leeway:* the outline is grown by 3 % of its size before cutting, so a slightly rough guide does not nibble the model.
+  - *Safety:* if more than 65 % of the model would be cut, the guide is rejected with a warning (usually a side view drawn facing the wrong way: set *front faces Left/Right*).
+- **See-through holes** (on by default). A hole is cut only where **two sources agree**: the generated image shows background there (an enclosed gap in its foreground mask), **and** your sketch has a closed loop there that the gap mostly fills. A bright highlight that background removal mistook for background is therefore never drilled. The hole is cut along TripoSR's camera rays, slightly inset from the rim.
+
+Both run on a voxel copy of the mesh (192 voxels across) and are re-meshed with marching cubes; colours and the baked texture still come from TripoSR's colour field. If the mesh already fits, it is left untouched. The model card reports what was trimmed (and the depth before → after), the holes opened, and the candidate gallery shows each guide's overlay.
+
+### 4.8 Confidence heatmap ("how sure are we")
+Every model gets a confidence map, from two measured signals:
+1. **Agreement.** Each run makes several TripoSR attempts (two framings per chosen variation). The others are aligned to the chosen one by their front-view box (width, height, centre) and front surface, and for every point we measure how far the other attempts' surfaces are. Within ~0 they agree; at 5 % of the object's size or more, TripoSR was guessing.
+2. **Visibility.** A z-buffer from TripoSR's input camera marks which points faced the camera and were not hidden behind other parts.
+
+Score = 0.65 · disagreement + 0.35 · hidden, lowered (× 0.4) where a guide view's outline pins the surface, then smoothed over the mesh. Mirrored backs inherit the score of the front they copy; the inner walls of a hollowed vessel inherit the outer wall's. **🌡 Confidence** in the viewer swaps the model for a heatmap: **green** = sure (seen and agreed), **yellow** = partly guessed, **red** = guessed. The model card gives the shares (sure / guessed / seen / fixed by guides). The heatmap is a separate OBJ for the viewer only; it is not in the downloads, follows depth changes, and survives a later texture bake (values are looked up by position).
+
+With a single attempt (one variation, one framing) only visibility is used, and the card says so.
 
 ## 5. Models, weights and licences
 
@@ -219,6 +243,7 @@ Headless (same pipeline, same outputs):
 python -m unveil.cli --sketch examples/mug.png --prompt "a glossy red ceramic mug" --mode precise --seed 42 --depth Medium
 python -m unveil.cli --sketch my_sketch.jpg --no-texture --variations 3 --top-k 1 --interior solid
 python -m unveil.cli --sketch examples/bottle.png --prompt "a green glass bottle" --wall 0.03
+python -m unveil.cli --sketch my_mug.png --side-view my_mug_side.png --side-front left --top-view my_mug_top.png
 python -m unveil.cli --preload-only    # just download every model
 ```
 
@@ -236,9 +261,10 @@ Each run writes `outputs/<YYYYMMDD-HHMMSS-xxxx>/`, with one `3d_v<i>-<j>/` folde
 | `3d_v…/unveil_<run>_all_depth1.00.zip` | Every model of the build in every format |
 | `3d_v…/…_depth<X>…` | Re-exports created by the depth control |
 | `3d_v…/model<N>_<level>.npz` | Final mesh (+UV/texture) used for depth re-exports |
+| `3d_v…/model<N>_<level>_depth<X>_confidence.obj`, `confidence_model<N>_<level>.npz` | Confidence heatmap for the viewer (vertex colours) and the per-point values it is made from |
 | `3d_v…/model<N>_<level>_section.png`, `candidate_*_overlay.png` | Cross-sections and verification overlays |
 | `cad/model1_cad_depth1.00.glb`, `…_obj.zip`, `cad/run.json` | A model built from a CAD drawing (dimensions, projection, holes, timings, validation) |
-| `run.json` (run folder = latest build, and inside each build) | Options, seeds, every score, the selection (auto/user), candidates, per-model interior decision and hollow stats, timings, validation reports, package versions |
+| `run.json` (run folder = latest build, and inside each build) | Options, seeds, every score, the selection (auto/user), candidates, per-model interior decision, hollow, guide and confidence stats, which guide views were given, timings, validation reports, package versions |
 
 Exported models are centred at the origin, Y-up, with the front facing +Z (glTF convention). Units are arbitrary, at about 1 unit tall, except CAD models, which keep the drawing's units.
 
@@ -253,14 +279,15 @@ pip install pytest
 python -m pytest -q tests
 ```
 
-53 CPU-only tests, plus 2 that need the TripoSR source (no model weights needed):
+62 CPU-only tests, plus 2 that need the TripoSR source (no model weights needed):
 - **Preprocessing:** outline → filled silhouette, inverted inputs, photos with uneven lighting, filled shapes, open strokes, speck noise, recentring, empty canvas errors.
 - **Mesh:** floater removal + winding repair, smoothing/decimation keeping colours, depth scaling changes only Z, projection orientation, silhouette scoring and flat-mesh rejection, texture bake correctness (colour sampled through the UVs), GLB/OBJ export + validation round-trips. **Hollowing:** solid voxelisation matches the true volume, a solid mug becomes a watertight open shell with a hollow middle and a solid handle, thin objects are refused, and hollow/solid is decided from prompts (including tricky ones like "a lamp with a glass shade"), from CLIP, or from the override. A mug tilted 25° (as a sketch drawn from above produces) opens fully along its own axis. **Symmetry:** a shifted symmetric object keeps its shape and volume, and a wrong guessed back (a box behind a sphere) is replaced by the mirrored front, watertight.
-- **CAD drawings:** third-angle L-bracket with a through hole (volume within 3 %, hole depth from the hidden lines), layer-named views with a border and text to ignore, a first-angle drawing (the wall must land at the back), a cylinder, a boss that must not be drilled, clear errors for unusable drawings, and a DWG round trip when LibreDWG is installed.
+- **Guide views, holes and confidence:** a too-deep box trimmed to an L-shaped side profile keeps its front and gets the right volume (also with the outline facing the other way), a top view trims a tapering footprint, a fitting guide leaves the mesh untouched, a mismatched guide is refused, a see-through hole is found only when the image and the sketch agree and is then drilled through a filled plate, and the confidence map is low where attempts agree and visible, high where they disagree, lowered by guides, and its heatmap OBJ survives re-indexed vertices and depth scaling.
+- **CAD drawings:** third-angle L-bracket with a through hole (volume within 3 %, hole depth from the hidden lines), layer-named views with a border and text to ignore, a pillow block sheet with dimensions, centre lines, a title block and a blind hole, a first-angle drawing (the wall must land at the back), a cylinder, a boss that must not be drilled, clear errors for unusable drawings, and a DWG round trip when LibreDWG is installed.
 - **TripoSR adapter:** axis-convention rotation, and the marching-cubes shim run through TripoSR's own `MarchingCubeHelper` (needs the TripoSR source).
-- **Pipeline flow:** the full orchestrator runs end to end with small deterministic stand-ins in place of the three neural networks. Everything else is real: preprocessing, background-removal fallback, scoring/ranking, the images-only phase, user selection of variations, two final models per run, front-back mirroring combined with hollowing and baking, the CAD-drawing run, hollowing, cleanup, verification, bake, export, the all-formats zip, validation, depth re-export and post-hoc baking. The Gradio UI build is also tested.
+- **Pipeline flow:** the full orchestrator runs end to end with small deterministic stand-ins in place of the three neural networks. Everything else is real: preprocessing, background-removal fallback, scoring/ranking, the images-only phase, user selection of variations, two final models per run, front-back mirroring combined with hollowing and baking, a side-view guide that trims the depth (with the heatmap following a depth re-export, and a bad guide failing before TripoSR runs), the CAD-drawing run, hollowing, cleanup, verification, bake, export, the all-formats zip, validation, depth re-export and post-hoc baking. The Gradio UI build is also tested.
 
-**Verification status of this draft.** The test suite passes, and the Gradio UI was driven in a browser with the stand-in models: example loading, *Generate 3D*, *Images first* → pick → *Build 3D from selected*, the progress card, all step galleries, both model cards with cross-sections, depth presets on both models, post-hoc baking and the downloads. The CAD tab, the symmetry toggle and the hollow fix were also checked in the browser (both example drawings, a one-view drawing giving one error popup, a symmetric hollow mug with baking). **The real SD/ControlNet/CLIP/TripoSR inference path has not yet been run on a GPU** (the development machine had none). The first Colab run is the integration test for those calls, and the first real check of tilt correction and mirroring on TripoSR meshes.
+**Verification status of this draft.** The test suite passes, and the Gradio UI was driven in a browser with the stand-in models: example loading, *Generate 3D*, *Images first* → pick → *Build 3D from selected*, the progress card, all step galleries, both model cards with cross-sections, depth presets on both models, post-hoc baking and the downloads. The CAD tab, the symmetry toggle and the hollow fix were also checked in the browser (both example drawings, a one-view drawing giving one error popup, a symmetric hollow mug with baking), and so were the guide views, holes and heatmap (a mug sketch with a handle and a side view drawn on the canvas: profile trimmed, handle opening cut, 🌡 Confidence toggling the heatmap, the heatmap following a depth change, no Confidence button on CAD models). **The real SD/ControlNet/CLIP/TripoSR inference path has not yet been run on a GPU** (the development machine had none). The first Colab run is the integration test for those calls, and the first real check of tilt correction and mirroring on TripoSR meshes.
 
 ## 11. Extending: adding another reconstruction model
 
@@ -270,12 +297,14 @@ python -m pytest -q tests
 
 ## 12. Limitations
 
-- **Hidden geometry is guessed.** A single view cannot determine the back of the object. TripoSR's guess can be too thin or too thick, which is what the depth control is for.
+- **Hidden geometry is guessed.** A single view cannot determine the back of the object. TripoSR's guess can be too thin or too thick, which is what the depth control and the side/top guide views (§4.7) are for; the confidence heatmap (§4.8) shows where it guessed.
 - **TripoSR quality ceiling.** Its meshes are smooth but low in detail at 256³. Thin structures (chair legs, lamp stems) can come out thick, merged or broken, and the largest-component filter may then drop a detached part. Textures come from one view, so the back is extrapolated.
 - **Hollowing assumes a vessel that opens upwards**, tilted by at most 45° (the tilt is corrected, §4.4). A cup lying on its side, or drawn from straight above, is carved the wrong way; use *Solid* in that case. Lids are drilled open.
 - **Front-back symmetry** mirrors about a plane facing the camera. If the object was drawn at an angle (a three-quarter view), its real symmetry plane is not that plane and mirroring distorts it; leave the option off for such sketches. The hollow decision is per category, not per instance: "a solid wooden bowl" is still hollowed unless you choose *Solid*. Depth scaling after hollowing also scales the front and back walls (Thin ⇒ thinner front/back walls).
 - **Hollowed models are re-meshed** from a ~160³ voxel grid, so very fine outer detail is softened slightly compared with TripoSR's own 256³ surface.
-- **Sketch → silhouette is 2D.** Holes in the object (a mug handle's opening) are filled in the reference silhouette, and interior detail lines are ignored by the silhouette metrics.
+- **Sketch → silhouette is 2D.** Holes in the object (a mug handle's opening) are filled in the reference silhouette, and interior detail lines are ignored by the silhouette metrics. See-through holes are only cut along the view direction, and only when the image and the sketch agree (§4.7).
+- **Guide views only remove material.** If TripoSR made the object too thin, a side view cannot thicken it (use the depth control). Guides are registered by height (side) or width (top), so a guide drawn with very different proportions from the front sketch is matched by that one dimension only. Trimmed models are re-meshed from a 192³ voxel grid.
+- **The confidence map is a heuristic**, not a calibrated probability: it shows where the attempts disagree and what the camera could not see. If all attempts make the same mistake, it is shown as sure.
 - **Scoring weights are hand-tuned**, not learned. CLIP ViT-B/32 is a coarse semantic judge.
 - **SD1.5 at 512²** limits image detail. SDXL was avoided to stay within T4 memory and time.
 - **Not production geometry:** no guaranteed manifoldness, no retopology, arbitrary units. This is out of the problem's mandatory scope.
@@ -294,6 +323,8 @@ python -m pytest -q tests
 | Mesh far too thin/thick | Use the depth presets or slider. |
 | Chosen candidate looks wrong | See step ⑤. Pick other variations in step ④ and press *Build 3D from selected*, or try a different seed. |
 | Cup/bowl came out solid (or a solid object came out hollow) | Name the object in the description, or set *Interior* to *Hollow* / *Solid*. The model card says why it decided. |
+| "Guide views not applied (… hardly overlap …)" | The side view is probably facing the other way: switch *front faces Left/Right*. Otherwise draw the outline of the whole object, same way up as the front sketch. |
+| A hole I drew was not opened | It needs a closed loop in the sketch **and** the generated image must show background through it. Pick a variation where it is see-through (step ④). |
 | CAD tab: "Reading .dwg needs a DWG converter" | Run Colab cell 3b (`bash scripts/install_libredwg.sh`), or save the drawing as DXF in AutoCAD (*Save As → DXF*). |
 | CAD tab: "Found 1 separate drawing(s)" / "Could not tell which view is which" | Remove the border/title block or move it to a BORDER layer, leave space between the views, or put them on layers named FRONT, TOP and SIDE. |
 | CAD tab: a hole was not cut | Show it with hidden (dashed) lines in another view, at both edges of the hole. |
@@ -312,7 +343,7 @@ Unveil/
 ├── scripts/setup_colab.sh         # deps + pinned TripoSR clone + import check
 ├── scripts/download_weights.py    # pre-fetch all weights
 ├── scripts/install_libredwg.sh    # optional: dwg2dxf for .dwg support
-├── examples/                      # sample sketches + two three-view DXF drawings
+├── examples/                      # sample sketches + three-view DXF drawings
 ├── tests/                         # CPU test suite (pytest)
 └── unveil/
     ├── config.py                  # all tunables
@@ -321,7 +352,7 @@ Unveil/
     ├── scoring.py                 # IoU / CLIP / clean-background scoring + ranking
     ├── background.py              # rembg + fallback, framing
     ├── reconstruction/            # Reconstructor interface, registry, TripoSR backend
-    ├── mesh/                      # asset, cleanup, symmetry, hollowing, verification, texture bake, export/validation
+    ├── mesh/                      # asset, cleanup, guide views & holes, confidence, symmetry, hollowing, verification, texture bake, export/validation
     ├── cad.py                     # CAD drawing (DXF/DWG, three views) -> solid
     ├── pipeline.py                # orchestration
     ├── ui.py                      # Gradio interface

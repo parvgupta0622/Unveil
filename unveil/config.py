@@ -100,6 +100,12 @@ class HollowConfig:
 
 
 @dataclass
+class GuideConfig:
+    resolution: int = 192  # voxels along the object's largest dimension when trimming to guide views
+    tolerance: float = 0.03  # leeway around a guide outline (x its size) before anything is cut
+
+
+@dataclass
 class CadConfig:
     resolution: int = 192  # voxels along the part's largest dimension (CAD drawing -> 3D)
     max_faces: int = 40_000  # marching cubes over-tessellates flat faces; decimate down to this
@@ -125,6 +131,7 @@ class UnveilConfig:
     verify: VerifyConfig = field(default_factory=VerifyConfig)
     hollow: HollowConfig = field(default_factory=HollowConfig)
     cad: CadConfig = field(default_factory=CadConfig)
+    guide: GuideConfig = field(default_factory=GuideConfig)
     rembg_model: str = "u2net"
     device: str = "auto"
     # None = decide from available VRAM (offload idle models to CPU on GPUs with < 13 GB).

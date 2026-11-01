@@ -15,7 +15,7 @@ import numpy as np
 
 from .config import DEPTH_PRESETS, DEPTH_RANGE, REPO_ROOT, WALL_RANGE, UnveilConfig
 from .mesh import format_report
-from .pipeline import CAD_STAGES, IMAGE_STAGES, STAGES, CadRun, ImageRun, PipelineError, RunOptions, RunResult, StageEvent, UnveilPipeline
+from .pipeline import CAD_STAGES, IMAGE_STAGES, STAGES, CadRun, GuideViews, ImageRun, PipelineError, RunOptions, RunResult, StageEvent, UnveilPipeline
 from .preprocess import SketchError
 from .utils import LOG, image_from_any, to_jsonable
 
@@ -39,6 +39,12 @@ CAD_HELP = """**What the drawing should contain:** one part, drawn as a **front,
 - **Holes:** a circle or closed shape inside a view is cut out when another view shows it with hidden lines (their length sets the depth). Without hidden lines it stays solid (a boss).
 - Built as the intersection of the three outlines, so curved shapes seen as a curve in only one view are approximated. Units follow the drawing (usually mm)."""
 PREP_TITLE = ("Sketch preprocessing", "Your input, the cleaned strokes, the ControlNet conditioning image and the filled silhouette used for scoring.")
+GUIDE_HELP = """Optional. TripoSR only sees the front, so it has to guess how deep the object is and what the back looks like.
+Draw the outline **from the side** and/or **from above** and the model is trimmed to fit it (nothing is added, the front is kept).
+
+- **Side view:** the object seen from its side, same way up. Say below which way its front faces.
+- **Top view:** looking down on it, with its front at the **bottom** of the canvas.
+- Only the outline matters and the size is matched automatically (by height for the side, width for the top). Rough is fine — a little leeway is allowed."""
 CAD_PREP_TITLE = ("Drawing analysis", "The views as Unveil read them (hidden lines dashed) and each view's filled outline; holes it will cut are red.")
 
 # Palette: ink #1a535c · aqua #4ecdc4 · mint #f7fff7 · coral #ff6b6b · sun #ffe66d
@@ -139,6 +145,8 @@ unveil-viewer {display: block}
 .dark .uv-bar button {border-color: #4ecdc4; color: #4ecdc4}
 .dark .uv-bar button.on {background: #4ecdc4; color: #0e2f35}
 .uv-hint {font-size: .8em; opacity: .65; margin-left: auto}
+.uv-legend {font-size: .8em}
+.uv-legend i {display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin: 0 4px 0 8px; vertical-align: -1px}
 #err-overlay {position: fixed !important; inset: 0; z-index: 1000; margin: 0 !important; padding: 16px !important;
               max-width: none !important; justify-content: center; align-items: center; background: rgba(14,47,53,.55)}
 #err-card {flex: none !important; width: min(520px, 100%); background: var(--block-background-fill); border-radius: 16px !important;
@@ -207,6 +215,8 @@ PAGE_JS = """
       this.innerHTML = `<div class="uv-stage"><div class="uv-msg">Loading 3D preview…</div></div>
         <div class="uv-bar"><button type="button" data-a="spin" class="on">⟳ Auto-spin</button>
         <button type="button" data-a="reset">⌖ Reset view</button><button type="button" data-a="wire">▦ Wireframe</button>
+        <button type="button" data-a="heat" hidden title="Where the model is sure and where it was guessed">🌡 Confidence</button>
+        <span class="uv-legend" hidden><i style="background:#23aa5a"></i>sure <i style="background:#f5c832"></i>partly guessed <i style="background:#dc3c32"></i>guessed</span>
         <span class="uv-hint">Drag to turn it any way · click, then scroll to zoom · right-drag to pan</span></div>`;
       loadLibs().then((L) => this.init(L)).catch((e) => this.fail("Could not load the 3D preview. The files below still download.", e));
     }
@@ -300,7 +310,31 @@ PAGE_JS = """
       this.resizer = new ResizeObserver(resize);
       this.resizer.observe(stage);
 
-      let wire = false;
+      let wire = false, heat = null, heatOn = false;
+      const heatBtn = this.querySelector('[data-a="heat"]');
+      if (this.dataset.heat) heatBtn.hidden = false;
+      // The confidence heatmap is a second OBJ with vertex colours, loaded on first use and swapped in place of the model.
+      const toggleHeat = async () => {
+        if (!heat) {
+          heatBtn.textContent = "🌡 Loading…";
+          const r = await fetch(fileUrl(this.dataset.heat), {cache: "no-store"});
+          heatBtn.textContent = "🌡 Confidence";
+          if (!r.ok || !this.alive) return;
+          heat = new OBJLoader().parse(await r.text());
+          heat.traverse((o) => {
+            if (!o.isMesh) return;
+            o.material = new THREE.MeshLambertMaterial({vertexColors: true, side: THREE.DoubleSide, wireframe: wire});
+          });
+          heat.position.copy(model.position);
+          heat.visible = false;
+          pivot.add(heat);
+        }
+        heatOn = !heatOn;
+        heat.visible = heatOn;
+        model.visible = !heatOn;
+        heatBtn.classList.toggle("on", heatOn);
+        this.querySelector(".uv-legend").hidden = !heatOn;
+      };
       this.querySelector(".uv-bar").addEventListener("click", (e) => {
         const b = e.target.closest("button");
         if (!b) return;
@@ -309,8 +343,9 @@ PAGE_JS = """
         if (b.dataset.a === "wire") {
           wire = !wire;
           b.classList.toggle("on", wire);
-          model.traverse((o) => { if (o.isMesh) for (const m of [].concat(o.material)) m.wireframe = wire; });
+          pivot.traverse((o) => { if (o.isMesh) for (const m of [].concat(o.material)) m.wireframe = wire; });
         }
+        if (b.dataset.a === "heat") toggleHeat().catch((err) => console.error("Unveil viewer: heatmap not loaded", err));
       });
       this.setSpin(true);
       const tick = () => {
@@ -425,6 +460,26 @@ class StageBoard:
         return out + "</div>"
 
 
+def _guide_pad(label: str):
+    return _kw(
+        gr.Sketchpad,
+        label=label,
+        type="pil",
+        image_mode="RGBA",
+        canvas_size=(384, 384),
+        brush=_kw(gr.Brush, default_size=4, colors=["#000000"], color_mode="fixed"),
+        eraser=_kw(gr.Eraser, default_size=16),
+        layers=False,
+        height=340,
+    )
+
+
+def _guides(side, top, front: str) -> GuideViews:
+    """Blank guide canvases count as not given."""
+    pick = lambda value: None if (img := image_from_any(value)) is None or _is_blank(img) else img  # noqa: E731
+    return GuideViews(side=pick(side), top=pick(top), side_front=front or "left")
+
+
 def _is_blank(img) -> bool:
     arr = np.asarray(img.convert("RGBA"))
     if arr[..., 3].max() == 0:
@@ -466,6 +521,10 @@ def _interior_note(o) -> str:
     lines = [f"**Interior:** {o.interior.describe()}"]
     if o.symmetry:
         lines.insert(0, f"**Symmetry:** {o.symmetry.describe()}")
+    if o.guide:
+        lines.insert(0, f"**Guides:** {o.guide.describe()}")
+    if o.confidence:
+        lines.append(f"**Confidence:** {o.confidence.describe()} — press 🌡 Confidence in the viewer to see where")
     if o.hollow:
         lines.append(f"<span class='small-note'>{o.hollow.describe()}</span>")
     if o.interior.top_labels:
@@ -490,7 +549,8 @@ def _cad_note(run: CadRun) -> str:
 
 def _viewer(bundle) -> str:
     """The OBJ (with its .mtl/texture next to it) in the in-page three.js viewer; the stamp forces a reload after re-exports."""
-    return f"<unveil-viewer data-obj=\"{html.escape(str(bundle.obj), quote=True)}\" data-v=\"{time.time_ns()}\"></unveil-viewer>"
+    heat = f" data-heat=\"{html.escape(str(bundle.heatmap), quote=True)}\"" if getattr(bundle, "heatmap", None) else ""
+    return f"<unveil-viewer data-obj=\"{html.escape(str(bundle.obj), quote=True)}\"{heat} data-v=\"{time.time_ns()}\"></unveil-viewer>"
 
 
 def _error_text(exc: Exception) -> str:
@@ -552,6 +612,11 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
                 )
             with gr.Row():
                 bake = gr.Checkbox(value=True, label="Bake UV texture (best colour in OBJ & other tools; ~10–30 s per model). Off = vertex colours.")
+                holes = gr.Checkbox(
+                    value=True,
+                    label="Open see-through holes",
+                    info="A gap you drew as a closed loop (like a mug handle's opening) that the generated image also shows as see-through is cut through the model.",
+                )
             with gr.Accordion("Advanced settings", open=False):
                 with gr.Row():
                     seed = gr.Number(value=42, label="Seed", precision=0)
@@ -594,6 +659,14 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
                     with gr.Accordion("How should the drawing look?", open=False):
                         gr.Markdown(CAD_HELP)
             with gr.Column() as sketch_controls:  # hidden while the CAD tab is open
+                with gr.Accordion("➕ Side / top view (optional) — fixes the hidden depth", open=False):
+                    gr.Markdown(GUIDE_HELP)
+                    with gr.Row():
+                        side_pad = _guide_pad("Side view")
+                        top_pad = _guide_pad("Top view (front at the bottom)")
+                    with gr.Row():
+                        side_front = gr.Radio([("Left", "left"), ("Right", "right")], value="left", label="In the side view, the object's front faces", scale=3)
+                        guide_clear = gr.Button("🗑️ Clear both", size="sm", scale=1)
                 prompt = gr.Textbox(label="Describe the object (optional)", placeholder="e.g. a matte black ceramic vase with gold rim", lines=2)
                 with gr.Row():
                     run_btn = gr.Button("✨ Generate 3D", variant="primary", size="lg", scale=3)
@@ -661,7 +734,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
         error_outputs = [err_box, err_md]
 
         # ------------------------------------------------------------------ helpers
-        def read_opts(prompt_v, mode_v, interior_v, wall_v, sym_v, bake_v, depth_v, seed_v, nvar_v, steps_v, cfg_v, topk_v, mc_v, smooth_v, tex_v, neg_v) -> RunOptions:
+        def read_opts(prompt_v, mode_v, interior_v, wall_v, sym_v, bake_v, holes_v, depth_v, seed_v, nvar_v, steps_v, cfg_v, topk_v, mc_v, smooth_v, tex_v, neg_v) -> RunOptions:
             return RunOptions(
                 prompt=prompt_v or "",
                 negative_prompt=neg_v or "",
@@ -679,6 +752,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
                 interior=interior_v or "auto",
                 wall_thickness=float(wall_v),
                 front_back_symmetric=bool(sym_v),
+                open_holes=bool(holes_v),
             )
 
         def popup(exc: Exception) -> dict:
@@ -780,7 +854,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
             return None
 
         # ------------------------------------------------------------------ handlers
-        def start(draw_v, upload_v, source, *settings, images_only: bool):
+        def start(draw_v, upload_v, source, side_v, top_v, front_v, *settings, images_only: bool):
             sketch = _pick_input(draw_v, upload_v, source)
             if sketch is None:
                 raise InputError("Draw something on the canvas or upload a sketch first.")
@@ -796,7 +870,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
             })
             yield first
             pipe = get_pipe()
-            events = pipe.run_images(sketch, opts) if images_only else pipe.run(sketch, opts)
+            events = pipe.run_images(sketch, opts) if images_only else pipe.run(sketch, opts, _guides(side_v, top_v, front_v))
             final = yield from stream(events, board, stages)
             if isinstance(final, RunResult):
                 yield show_result(final, board)
@@ -812,7 +886,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
         def on_images(*args):
             yield from start(*args, images_only=True)
 
-        def on_build(run_id, selection, *settings):
+        def on_build(run_id, selection, side_v, top_v, front_v, *settings):
             if not run_id:
                 raise InputError("Generate the images first.")
             if not selection:
@@ -825,7 +899,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
             first = clear_models()
             first.update({status: board.html(), progress_card: gr.update(visible=True)})
             yield first
-            final = yield from stream(get_pipe().run_3d(run_id, [int(i) for i in selection], opts), board)
+            final = yield from stream(get_pipe().run_3d(run_id, [int(i) for i in selection], opts, _guides(side_v, top_v, front_v)), board)
             if isinstance(final, RunResult):
                 yield show_result(final, board)
 
@@ -878,13 +952,14 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
             })
             return out
 
-        settings = [prompt, mode, interior, wall, symmetric, bake, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
-        build_settings = [interior, wall, symmetric, bake, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
+        settings = [prompt, mode, interior, wall, symmetric, bake, holes, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
+        build_settings = [interior, wall, symmetric, bake, holes, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
         sections = [progress_card, prep_card, var_card, pick_box, cand_card, final_card, details_card]
         outputs = [status, prep_title, prep_gallery, var_gallery, score_table, pick, image_state, cand_gallery, details, run_state, bake_btn, all_zip, final_note] + sections + slot_components + error_outputs
-        run_btn.click(guarded(on_generate), [sketchpad, upload, input_source] + settings, outputs, concurrency_limit=1, show_progress="hidden")
-        images_btn.click(guarded(on_images), [sketchpad, upload, input_source] + settings, outputs, concurrency_limit=1, show_progress="hidden")
-        build_btn.click(guarded(on_build), [image_state, pick] + build_settings, outputs, concurrency_limit=1, show_progress="hidden")
+        guide_inputs = [side_pad, top_pad, side_front]
+        run_btn.click(guarded(on_generate), [sketchpad, upload, input_source] + guide_inputs + settings, outputs, concurrency_limit=1, show_progress="hidden")
+        images_btn.click(guarded(on_images), [sketchpad, upload, input_source] + guide_inputs + settings, outputs, concurrency_limit=1, show_progress="hidden")
+        build_btn.click(guarded(on_build), [image_state, pick] + guide_inputs + build_settings, outputs, concurrency_limit=1, show_progress="hidden")
         cad_btn.click(guarded(on_cad), [cad_file, depth], outputs, concurrency_limit=1, show_progress="hidden")
         err_close.click(lambda: gr.update(visible=False), None, err_box, show_progress="hidden")
 
@@ -893,6 +968,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
         cad_tab.select(lambda: gr.update(visible=False), None, sketch_controls)
         upload.change(lambda img: "upload" if img is not None else gr.update(), upload, input_source)
         clear_btn.click(lambda: None, None, sketchpad)
+        guide_clear.click(lambda: (None, None), None, [side_pad, top_pad])
 
         model_outputs = [all_zip] + [s[k] for s in slots for k in ("view", "files", "report")] + error_outputs
         depth_preset.input(lambda p: gr.update(value=DEPTH_PRESETS[p]) if p in DEPTH_PRESETS else gr.update(), depth_preset, depth).then(
