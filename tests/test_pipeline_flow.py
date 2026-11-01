@@ -199,6 +199,41 @@ def test_bake_after_run(pipe):
     assert all(b.textured and b.report["passed"] for b in bundles) and not warnings
 
 
+def test_front_back_symmetry_with_hollow_and_bake(pipe):
+    _, result = _run(pipe, front_back_symmetric=True, prompt="a red ceramic mug", top_k_images=1)
+    o = result.outputs[0]
+    assert o.symmetry is not None and o.hollow is not None
+    assert o.bundle.textured and o.bundle.report["passed"], o.bundle.report["checks"]
+    assert result.summary["outputs"][0]["symmetry"]["plane_z"] == pytest.approx(0.0, abs=0.03)  # slab centred on z = 0
+
+
+def test_cad_drawing_run(pipe, tmp_path):
+    pytest.importorskip("ezdxf")
+    from tests.cad_drawings import l_bracket
+    from unveil.pipeline import CadRun
+
+    path = tmp_path / "bracket.dxf"
+    l_bracket(path)
+    events = list(pipe.run_cad(path))
+    run = events[-1]
+    assert isinstance(run, CadRun)
+    assert [e.stage for e in events[:-1] if e.status == "done"] == ["cad_read", "cad_views", "cad_solid", "export"]
+    assert any("cad_images" in e.payload for e in events[:-1])
+    assert run.bundle.report["passed"], run.bundle.report["checks"]
+    assert run.bundle.report["stats"]["extents_xyz"] == pytest.approx([100, 50, 60], rel=0.02)  # x, height, depth
+    thin, _ = pipe.reexport(run.build_dir, 0.5)  # the depth control works on CAD models too
+    assert thin[0].report["stats"]["extents_xyz"][2] == pytest.approx(30, rel=0.02)
+
+    import ezdxf
+
+    doc = ezdxf.new()
+    doc.modelspace().add_circle((0, 0), 5)
+    doc.saveas(tmp_path / "one.dxf")
+    with pytest.raises(PipelineError) as err:
+        list(pipe.run_cad(tmp_path / "one.dxf"))
+    assert err.value.stage == "cad_views" and "three views" in str(err.value) and "CadError" not in str(err.value)
+
+
 def test_category_lists_do_not_overlap():
     assert not set(HOLLOW_OBJECTS) & set(SOLID_OBJECTS)
 

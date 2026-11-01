@@ -15,6 +15,7 @@ xatlas>=0.0.9
 fast-simplification>=0.1.7
 scikit-image>=0.21
 scipy>=1.10
+ezdxf>=1.1  # CAD-drawing tab (DXF; DWG via LibreDWG, scripts/install_libredwg.sh)
 opencv-python-headless>=4.8
 numpy>=1.24
 Pillow>=10.0

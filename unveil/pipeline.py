@@ -19,6 +19,7 @@ import numpy as np
 import trimesh
 from PIL import Image
 
+from . import cad
 from .background import BackgroundRemover
 from .config import UnveilConfig
 from .generation import SketchImageGenerator, Variation, build_prompt
@@ -30,12 +31,14 @@ from .mesh import (
     InteriorDecision,
     MeshAsset,
     MeshError,
+    SymmetryStats,
     bake_texture,
     clean_mesh,
     decide_interior,
     decimate,
     export_asset,
     hollow_out,
+    mirror_front_back,
     score_candidate,
     section_image,
     smooth_mesh,
@@ -51,11 +54,18 @@ STAGES: List[Tuple[str, str]] = [
     ("generate", "ControlNet variations"),
     ("select_image", "Variation scoring & selection"),
     ("reconstruct", "TripoSR candidates & verification"),
-    ("interior", "Hollow / solid interior"),
+    ("interior", "Symmetry & hollow / solid interior"),
     ("refine", "Mesh refinement & texture"),
     ("export", "Export & validation"),
 ]
 IMAGE_STAGES = STAGES[:3]
+# CAD drawing -> 3D (no neural models involved).
+CAD_STAGES: List[Tuple[str, str]] = [
+    ("cad_read", "Read the drawing"),
+    ("cad_views", "Find front / top / side views"),
+    ("cad_solid", "Build the solid"),
+    ("export", "Export & validation"),
+]
 
 
 class PipelineError(RuntimeError):
@@ -82,6 +92,7 @@ class RunOptions:
     depth_scale: float = 1.0
     interior: str = "auto"  # auto | hollow | solid
     wall_thickness: float = 0.05  # fraction of the object's largest dimension
+    front_back_symmetric: bool = False  # rebuild the hidden back as a mirror image of the visible front
 
 
 @dataclass
@@ -162,6 +173,7 @@ class FinalOutput:
     hollow: Optional[HollowStats]
     section: Image.Image
     score: CandidateScore
+    symmetry: Optional[SymmetryStats] = None
 
     def summary(self) -> dict:
         return {
@@ -172,6 +184,7 @@ class FinalOutput:
             "files": {"glb": str(self.bundle.glb), "obj_zip": str(self.bundle.obj_zip)},
             "interior": asdict(self.interior),
             "hollow": asdict(self.hollow) if self.hollow else None,
+            "symmetry": asdict(self.symmetry) if self.symmetry else None,
             "validation_passed": self.bundle.report.get("passed"),
         }
 
@@ -194,6 +207,22 @@ class RunResult:
     def bundle(self) -> ExportBundle:
         """The first (highest-ranked selected) model."""
         return self.outputs[0].bundle
+
+
+@dataclass
+class CadRun:
+    """A model built from a three-view CAD drawing."""
+
+    run_id: str
+    build_dir: Path
+    source: str  # uploaded file name
+    model: "cad.CadModel"
+    asset_path: Path
+    bundle: ExportBundle
+    all_zip: Path
+    section: Image.Image
+    summary: Dict[str, Any]
+    warnings: List[str]
 
 
 def select_best(candidates: List[Candidate]) -> Optional[Candidate]:
@@ -288,6 +317,10 @@ class UnveilPipeline:
             opts = replace(opts, **{k: getattr(img.opts, k) for k in keep})
         yield from self._guard(self._models(img, selection, opts or img.opts, "user"), "reconstruct")
 
+    def run_cad(self, path: Path, depth_scale: float = 1.0) -> Iterator[Union[StageEvent, CadRun]]:
+        """Solid from a DXF/DWG with front, top and side views (see unveil/cad.py)."""
+        yield from self._guard(self._cad(Path(path), depth_scale), "cad_read")
+
     def _guard(self, events: Iterator[Any], stage: str) -> Iterator[Any]:
         try:
             for event in events:
@@ -296,6 +329,8 @@ class UnveilPipeline:
                 yield event
         except (SketchError, PipelineError):
             raise
+        except cad.CadError as exc:
+            raise PipelineError(stage, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - convert to a stage-tagged, user-readable error
             if _is_oom(exc):
                 free_gpu_memory()
@@ -437,27 +472,37 @@ class UnveilPipeline:
                 candidate_gallery.append((Image.new("RGB", (512, 256), (245, 245, 245)), f"#{c.index + 1} failed: {c.error}"))
         yield StageEvent("reconstruct", "done", "Best: " + ", ".join(f"candidate #{f.index + 1}" for f in finals), payload={"candidates": candidate_gallery})
 
-        # 5. Interior: hollow vessels get a real cavity, everything else stays solid -----------
-        yield StageEvent("interior", "start", "Deciding hollow vs solid")
+        # 5. Shape: optional front-back mirror, then hollow vessels get a real cavity --------
+        yield StageEvent("interior", "start", "Mirroring the front onto the back" if opts.front_back_symmetric else "Deciding hollow vs solid")
         shaped = []  # (candidate, mesh, decision, hollow stats, colour-query remap)
+        symmetry: Dict[int, SymmetryStats] = {}
         with timer("interior"):
             for slot, c in enumerate(finals):
+                mesh, stats, remap = c.mesh, None, None
+                if opts.front_back_symmetric:
+                    yield StageEvent("interior", "progress", f"Model {slot + 1}: rebuilding the back as a mirror of the front", fraction=slot / len(finals))
+                    mirrored, reason = mirror_front_back(mesh)
+                    if mirrored is None:
+                        warnings.append(f"Model {slot + 1}: front-back symmetry skipped ({reason}).")
+                    else:
+                        mesh, remap, symmetry[slot] = mirrored.mesh, mirrored.remap, mirrored.stats
                 image = variations[c.variation].image
                 zero_shot = None
                 if opts.interior == "auto" and hasattr(self.clip, "zero_shot"):
                     self._use("clip")
                     zero_shot = lambda labels, image=image: self.clip.zero_shot(image, labels)  # noqa: E731
                 decision = decide_interior(opts.prompt, opts.interior, zero_shot)
-                mesh, stats, remap = c.mesh, None, None
                 if decision.hollow:
                     yield StageEvent("interior", "progress", f"Model {slot + 1}: carving the cavity ({decision.describe()})", fraction=slot / len(finals))
-                    hollowed, reason = hollow_out(c.mesh, opts.wall_thickness, self.cfg.hollow.voxel_resolution, min(opts.smooth_iterations, 3))
+                    hollowed, reason = hollow_out(mesh, opts.wall_thickness, self.cfg.hollow.voxel_resolution, min(opts.smooth_iterations, 3))
                     if hollowed is None:
                         warnings.append(f"Model {slot + 1} was kept solid: {reason}.")
                     else:
-                        mesh, stats, remap = hollowed.mesh, hollowed.stats, hollowed.remap
+                        outer = remap
+                        mesh, stats = hollowed.mesh, hollowed.stats
+                        remap = hollowed.remap if outer is None else (lambda pts, h=hollowed.remap, o=outer: o(h(pts)))
                 shaped.append((c, mesh, decision, stats, remap))
-        yield StageEvent("interior", "done", " · ".join(f"Model {i + 1}: {'hollow' if s else 'solid'}" for i, (_, _, _, s, _) in enumerate(shaped)))
+        yield StageEvent("interior", "done", " · ".join(f"Model {i + 1}: {'mirrored, ' if i in symmetry else ''}{'hollow' if s else 'solid'}" for i, (_, _, _, s, _) in enumerate(shaped)))
 
         # 6. Refine: decimate + optional UV texture bake ----------------------------------
         yield StageEvent("refine", "start", "Baking UV textures" if opts.bake_texture else "Finalising meshes (vertex colours)")
@@ -484,7 +529,7 @@ class UnveilPipeline:
                 bundle = export_asset(asset, build_dir, opts.depth_scale, asset_path.stem)
                 section = section_image(asset.vertices, asset.faces)
                 section.save(build_dir / f"{asset_path.stem}_section.png")
-                outputs.append(FinalOutput(slot, c.variation, variations[c.variation].level.name, c.index, asset_path, bundle, decision, stats, section, c.score))
+                outputs.append(FinalOutput(slot, c.variation, variations[c.variation].level.name, c.index, asset_path, bundle, decision, stats, section, c.score, symmetry.get(slot)))
                 if not bundle.report["passed"]:
                     warnings.append(f"Model {slot + 1}: some export validation checks failed - see its validation report.")
             all_zip = zip_bundles([o.bundle for o in outputs], build_dir / f"unveil_{img.run_id}_all_depth{opts.depth_scale:.2f}.zip")
@@ -533,6 +578,56 @@ class UnveilPipeline:
             LOG.exception("Texture bake failed")
             warnings.append(f"Texture bake failed ({type(exc).__name__}: {exc}); using vertex colours.")
             return asset
+
+    # ------------------------------------------------------------------ CAD drawing -> 3D
+    def _cad(self, path: Path, depth_scale: float) -> Iterator[Union[StageEvent, CadRun]]:
+        run_id = new_run_id()
+        build_dir = Path(self.cfg.output_dir) / run_id / "cad"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        timer = StageTimer()
+        is_dwg = path.suffix.lower() == ".dwg"
+
+        yield StageEvent("cad_read", "start", "Converting DWG → DXF and reading it" if is_dwg else "Reading the DXF")
+        with timer("cad_read"):
+            doc = cad.read_drawing(path)
+            curves = cad.extract_curves(doc)
+        hidden = sum(c.hidden for c in curves)
+        yield StageEvent("cad_read", "done", f"{len(curves)} curves ({hidden} hidden)")
+
+        yield StageEvent("cad_views", "start", "Finding the front, top and side views")
+        with timer("cad_views"):
+            views, projection, source, warnings = cad.find_views(curves)
+        yield StageEvent("cad_views", "done", f"{projection} projection, views from {'layer names' if source == 'layers' else 'their layout'}")
+
+        yield StageEvent("cad_solid", "start", "Intersecting the three outlines and cutting holes")
+        with timer("cad_solid"):
+            mesh, holes, sil, dims = cad.build_solid(views, self.cfg.cad.resolution)
+            model = cad.assemble(doc, curves, views, projection, source, mesh, holes, sil, dims, warnings)
+        w, d, h = model.dimensions
+        yield StageEvent("cad_solid", "done", f"{w:.4g} × {d:.4g} × {h:.4g} {model.units} · {len(holes)} hole(s)",
+                         payload={"cad_images": [(model.preview, "Detected views (hidden lines dashed)")] + [(img, f"{name} silhouette" + (" · holes in red" if any(x.view == name for x in holes) else "")) for name, img in model.silhouettes.items()]})
+
+        yield StageEvent("export", "start", "Writing GLB/OBJ and re-opening them to validate")
+        with timer("export"):
+            asset = MeshAsset.from_trimesh(decimate(model.mesh, self.cfg.cad.max_faces))  # flat faces: few triangles needed
+            asset_path = build_dir / "model1_cad.npz"
+            asset.save(asset_path)
+            bundle = export_asset(asset, build_dir, depth_scale, asset_path.stem)
+            section = section_image(asset.vertices, asset.faces)
+            all_zip = zip_bundles([bundle], build_dir / f"unveil_{run_id}_all_depth{depth_scale:.2f}.zip")
+        summary = {
+            "run_id": run_id,
+            "source": path.name,
+            "cad": model.summary(),
+            "timings_s": dict(timer.timings, total=round(sum(timer.timings.values()), 3)),
+            "validation": [bundle.report],
+            "versions": _versions(),
+        }
+        write_json(summary, build_dir / "run.json")
+        if not bundle.report["passed"]:
+            model.warnings.append("Some export validation checks failed - see the validation report.")
+        yield StageEvent("export", "done", f"{len(asset.faces):,} faces · " + ("validation passed" if bundle.report["passed"] else "validation found issues"))
+        yield CadRun(run_id, build_dir, path.name, model, asset_path, bundle, all_zip, section, summary, model.warnings)
 
     # ------------------------------------------------------------------ post-run actions
     @staticmethod

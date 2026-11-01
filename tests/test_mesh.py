@@ -173,6 +173,69 @@ def test_hollow_out_carves_open_cavity_with_walls():
     assert np.linalg.norm(mapped[0]) > 0.2 and np.allclose(mapped[1], pts[1])
 
 
+@pytest.mark.parametrize("axis", [(1, 0, 0), (0, 0, 1)])
+def test_hollow_out_opens_tilted_vessel_along_its_own_axis(axis):
+    """A sketch drawn from above makes TripoSR tilt the mug towards the camera: the mouth must still open."""
+    from unveil.mesh import hollow_out
+    from unveil.mesh.hollow import voxelize_solid
+
+    cup = _solid_cup()
+    tilt = trimesh.transformations.rotation_matrix(np.radians(25), axis)
+    cup.apply_transform(tilt)
+    result, reason = hollow_out(cup, wall_fraction=0.05, resolution=120)
+    assert result is not None, reason
+    assert result.stats.opened and result.stats.tilt_deg == pytest.approx(25, abs=2)
+    assert result.stats.mouth_fraction > 0.8
+    upright = result.mesh.copy()
+    upright.apply_transform(np.linalg.inv(tilt))
+    pitch, n = 0.01, 100
+    occ = voxelize_solid(upright.vertices, upright.faces, np.full(3, -0.5), pitch, (n, n, n))
+    c = (np.arange(n) + 0.5) * pitch - 0.5
+    x, z = np.meshgrid(c, c, indexing="ij")
+    inner = x**2 + z**2 < 0.2**2
+    above_floor = occ[:, c > -0.25, :].any(axis=1)
+    assert not above_floor[inner].any()  # looking down the mug's axis, nothing covers the inside
+
+
+# ---------------------------------------------------------------------------------------------- symmetry
+def test_mirror_front_back_keeps_symmetric_object():
+    from unveil.mesh import mirror_front_back
+
+    sphere = _colored(trimesh.creation.icosphere(subdivisions=4, radius=0.4))
+    sphere.apply_translation((0.1, 0.0, 0.13))
+    result, reason = mirror_front_back(sphere)
+    assert result is not None, reason
+    assert result.stats.plane_z == pytest.approx(0.13, abs=0.01)
+    mesh = result.mesh
+    assert mesh.is_watertight and mesh.visual.kind == "vertex"
+    assert signed_volume(mesh.vertices, mesh.faces) == pytest.approx(sphere.volume, rel=0.01)
+    back, front = result.remap(np.array([[0.1, 0.0, -0.1], [0.1, 0.0, 0.3]]))
+    np.testing.assert_allclose(back, [0.1, 0.0, 0.36], atol=0.01)  # behind the plane -> its mirror image
+    np.testing.assert_allclose(front, [0.1, 0.0, 0.3])
+
+
+def test_mirror_front_back_replaces_a_wrong_back():
+    """Front half is a sphere, the guessed back a big box: the box must be replaced by the sphere's mirror."""
+    from skimage.measure import marching_cubes
+
+    from unveil.mesh import mirror_front_back
+
+    g = np.linspace(-0.6, 0.6, 97)
+    x, y, z = np.meshgrid(g, g, g, indexing="ij")
+    sphere = 0.4 - np.sqrt(x**2 + y**2 + z**2)
+    box = np.minimum(np.minimum(0.3 - np.abs(x), 0.3 - np.abs(y)), np.minimum(z + 0.55, -z))
+    verts, faces, _, _ = marching_cubes(np.maximum(sphere, box).astype(np.float32), 0.0, spacing=(g[1] - g[0],) * 3)
+    lump = trimesh.Trimesh(verts - 0.6, faces, process=False)
+    if signed_volume(lump.vertices, lump.faces) < 0:
+        lump = trimesh.Trimesh(lump.vertices, lump.faces[:, ::-1], process=False)
+    result, reason = mirror_front_back(_colored(lump))
+    assert result is not None, reason
+    assert result.stats.plane_z == pytest.approx(0.0, abs=0.03)
+    assert result.mesh.is_watertight
+    assert result.mesh.bounds[0, 2] == pytest.approx(-0.4, abs=0.03)  # was -0.55 (the box)
+    assert result.stats.depth_after < result.stats.depth_before
+
+
 def test_hollow_out_refuses_thin_objects():
     from unveil.mesh import hollow_out
 

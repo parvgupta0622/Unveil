@@ -33,6 +33,7 @@ def main(argv=None) -> int:
     p.add_argument("--depth", default="1.0", help=f"depth scale or preset name {list(DEPTH_PRESETS)}")
     p.add_argument("--interior", choices=list(INTERIOR_MODES), default="auto", help="hollow vessels (cups, bowls, ...) or keep solid")
     p.add_argument("--wall", type=float, default=0.05, help="wall thickness of hollow objects, fraction of the object size")
+    p.add_argument("--symmetric", action="store_true", help="object is front-back symmetric: mirror the visible front onto the back")
     p.add_argument("--output-dir", default=None)
     p.add_argument("--low-vram", action="store_true")
     p.add_argument("--preload-only", action="store_true", help="download and load every model, then exit")
@@ -65,6 +66,7 @@ def main(argv=None) -> int:
         depth_scale=depth,
         interior=args.interior,
         wall_thickness=args.wall,
+        front_back_symmetric=args.symmetric,
     )
     try:
         for ev in pipe.run(Image.open(args.sketch), opts):

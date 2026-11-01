@@ -4,10 +4,11 @@ TripoSR (like most single-image reconstructors) always returns a closed solid: a
 cylinder. For vessels (cups, bowls, bottles, vases, ...) this module carves a real cavity:
 
 1. Decide hollow vs solid from the object's name (prompt keywords) or, without one, a CLIP zero-shot guess.
-2. Voxelise the mesh as a solid (ray parity along all three axes, majority vote: robust to small holes).
+2. Voxelise the mesh (rotated so the vessel axis is +y) as a solid (ray parity along all three axes, majority vote: robust to small holes).
 3. Fill each horizontal slice so a partial dip TripoSR may have made becomes solid again.
 4. Erode by the wall thickness (Euclidean distance transform) -> cavity with equal walls and floor.
-5. Drill the cavity open through the top (+y), following the rim/neck slice by slice.
+5. Drill the cavity open through the top, following the rim/neck slice by slice. "Top" is the vessel's own
+   axis (from its flat rim and base), not the view's +y: sketches drawn from above come back tilted.
 6. Marching cubes on the remaining shell; colours come from the nearest point of the original surface.
 """
 from __future__ import annotations
@@ -151,6 +152,49 @@ def voxelize_solid(vertices: np.ndarray, faces: np.ndarray, origin: np.ndarray, 
     return (votes * 2 > valid) & (valid > 0)
 
 
+def _dominant_normal(normals: np.ndarray, areas: np.ndarray, start: np.ndarray, cones_deg: Sequence[float] = (40, 40, 30, 30, 20, 20, 15, 15, 15, 15)) -> Tuple[np.ndarray, float]:
+    """Mean shift on area-weighted face normals from `start`: the direction a flat cap/base faces, plus the
+    fraction of the surface area that supports it. The window narrows so noisy side walls at its edge cannot
+    drag the estimate sideways."""
+    d = start.astype(np.float64)
+    support = 0.0
+    for cone in cones_deg:
+        near = normals @ d > np.cos(np.radians(cone))
+        if not near.any():
+            return start, 0.0
+        new = (normals[near] * areas[near, None]).sum(0)
+        new /= np.linalg.norm(new) + 1e-12
+        support = float(areas[near].sum() / areas.sum())
+        d = new
+    return d, support
+
+
+def vessel_axis(mesh: trimesh.Trimesh, max_tilt_deg: float = 45.0) -> np.ndarray:
+    """Up-axis of a vessel. A sketch drawn from slightly above makes TripoSR return the object tilted towards
+    the camera, so its mouth no longer faces +y; the rim/lid and the base are the flat areas whose normals
+    point roughly up and down, and their mean directions give the real axis."""
+    normals, areas = np.asarray(mesh.face_normals), np.asarray(mesh.area_faces)
+    up, s_up = _dominant_normal(normals, areas, np.array([0.0, 1.0, 0.0]))
+    down, s_down = _dominant_normal(normals, areas, np.array([0.0, -1.0, 0.0]))
+    axis = s_up * up - s_down * down
+    if np.linalg.norm(axis) < 1e-9:
+        return np.array([0.0, 1.0, 0.0])
+    axis /= np.linalg.norm(axis)
+    if np.degrees(np.arccos(np.clip(axis[1], -1, 1))) > max_tilt_deg:  # implausible: keep the view's up
+        return np.array([0.0, 1.0, 0.0])
+    return axis
+
+
+def _rotation_to_y(axis: np.ndarray) -> np.ndarray:
+    """Rotation matrix taking `axis` onto +y (Rodrigues)."""
+    y = np.array([0.0, 1.0, 0.0])
+    v, c = np.cross(axis, y), float(axis @ y)
+    if np.linalg.norm(v) < 1e-9:
+        return np.eye(3)
+    k = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + k + k @ k / (1.0 + c)
+
+
 def _largest(mask: np.ndarray) -> np.ndarray:
     labels, n = ndi.label(mask)
     if n <= 1:
@@ -168,10 +212,13 @@ class HollowStats:
     opened: bool  # cavity reaches the outside through the top
     cavity_fraction: float  # cavity volume / filled volume
     faces: int
+    tilt_deg: float = 0.0  # angle between the vessel's own axis and the view's up (+y)
+    mouth_fraction: float = 0.0  # opening width / the cavity's widest width
 
     def describe(self) -> str:
-        top = "open at the top" if self.opened else "closed (sealed cavity)"
-        return f"cavity {self.cavity_fraction:.0%} of the volume, walls ≈ {self.wall_fraction:.1%} of the size, {top}"
+        top = f"open at the top (opening ≈ {self.mouth_fraction:.0%} of the inside width)" if self.opened else "closed (sealed cavity)"
+        tilt = f", axis tilted {self.tilt_deg:.0f}° (corrected)" if self.tilt_deg >= 3 else ""
+        return f"cavity {self.cavity_fraction:.0%} of the volume, walls ≈ {self.wall_fraction:.1%} of the size, {top}{tilt}"
 
 
 @dataclass
@@ -182,14 +229,19 @@ class HollowResult:
 
 
 def hollow_out(mesh: trimesh.Trimesh, wall_fraction: float = 0.05, resolution: int = 160, smooth_iterations: int = 3) -> Tuple[Optional[HollowResult], str]:
-    """Carve an open-top cavity with walls `wall_fraction` x the object's size. Returns (result, reason)."""
+    """Carve an open-top cavity with walls `wall_fraction` x the object's size. Returns (result, reason).
+    The carving runs in a frame where the vessel's own axis is +y, so a tilted mug still opens at its rim."""
     vertices = np.asarray(mesh.vertices, np.float64)
-    lo, hi = vertices.min(0), vertices.max(0)
+    axis = vessel_axis(mesh)
+    rot = _rotation_to_y(axis)  # original -> upright; upright -> original is rot.T
+    tilt = float(np.degrees(np.arccos(np.clip(axis[1], -1, 1))))
+    upright = vertices @ rot.T
+    lo, hi = upright.min(0), upright.max(0)
     pitch = float((hi - lo).max()) / resolution
     pad = 3
     origin = lo - pad * pitch
     shape = tuple(np.ceil((hi - lo) / pitch).astype(int) + 2 * pad + 1)
-    solid = voxelize_solid(vertices, np.asarray(mesh.faces), origin, pitch, shape)
+    solid = voxelize_solid(upright, np.asarray(mesh.faces), origin, pitch, shape)
     solid = _largest(ndi.binary_closing(solid, iterations=1) | solid)
     if solid.sum() < 1000:
         return None, "the mesh could not be voxelised as a closed solid"
@@ -210,7 +262,7 @@ def hollow_out(mesh: trimesh.Trimesh, wall_fraction: float = 0.05, resolution: i
     mouth = np.zeros_like(filled)
     top = int(np.nonzero(cavity.any(axis=(0, 2)))[0].max())
     footprint = cavity[:, top, :]
-    opened = False
+    opened, mouth_areas = False, []
     for j in range(top + 1, shape[1]):
         grown = cv2.dilate(footprint.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         layer = filled[:, j, :]
@@ -222,13 +274,18 @@ def hollow_out(mesh: trimesh.Trimesh, wall_fraction: float = 0.05, resolution: i
         if not footprint.any():
             break
         mouth[:, j, :] = footprint
+        mouth_areas.append(int(footprint.sum()))
     shell = _largest(filled & ~cavity & ~mouth)
+    # Opening width vs the cavity's widest section (mug ~100%, necked bottle much less). Upper quartile of the
+    # drilled slices, so the rounded last voxel layer at the rim does not count as the opening.
+    widest = cavity.sum(axis=(0, 2)).max()
+    mouth_fraction = float(np.sqrt(np.percentile(mouth_areas, 75) / widest)) if opened and mouth_areas else 0.0
 
     field = ndi.gaussian_filter(shell.astype(np.float32), 0.8)
     from skimage.measure import marching_cubes
 
     verts, faces, _, _ = marching_cubes(field, 0.5)
-    verts = verts * pitch + origin
+    verts = (verts * pitch + origin) @ rot  # back to the original (view) frame
     if signed_volume(verts, faces) < 0:
         faces = faces[:, ::-1]
 
@@ -252,6 +309,8 @@ def hollow_out(mesh: trimesh.Trimesh, wall_fraction: float = 0.05, resolution: i
         opened=opened,
         cavity_fraction=round(float((cavity | mouth).sum() / filled.sum()), 4),
         faces=int(len(out.faces)),
+        tilt_deg=round(tilt, 1),
+        mouth_fraction=round(min(1.0, mouth_fraction), 3),
     )
     return HollowResult(out, stats, remap), ""
 

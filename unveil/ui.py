@@ -1,5 +1,6 @@
 """Gradio interface: settings and sketch on top, then each pipeline step appears below as soon as it has results —
-preprocessing, variations (with choice), TripoSR candidates and the final models in a 360° OBJ viewer with downloads."""
+preprocessing, variations (with choice), TripoSR candidates and the final models in a 360° OBJ viewer with downloads.
+A third input tab builds a solid from a CAD drawing (DXF/DWG with front, top and side views) instead."""
 from __future__ import annotations
 
 import html
@@ -14,7 +15,7 @@ import numpy as np
 
 from .config import DEPTH_PRESETS, DEPTH_RANGE, REPO_ROOT, WALL_RANGE, UnveilConfig
 from .mesh import format_report
-from .pipeline import IMAGE_STAGES, STAGES, ImageRun, PipelineError, RunOptions, RunResult, StageEvent, UnveilPipeline
+from .pipeline import CAD_STAGES, IMAGE_STAGES, STAGES, CadRun, ImageRun, PipelineError, RunOptions, RunResult, StageEvent, UnveilPipeline
 from .preprocess import SketchError
 from .utils import LOG, image_from_any, to_jsonable
 
@@ -27,7 +28,18 @@ EXAMPLES = [
     ("lamp.png", "a modern table lamp with a white fabric shade and brass base"),
     ("bottle.png", ""),
 ]
-STAGE_SHORT = {"preprocess": "Preprocess", "generate": "ControlNet", "select_image": "Scoring", "reconstruct": "TripoSR", "interior": "Interior", "refine": "Refine", "export": "Export"}
+STAGE_SHORT = {"preprocess": "Preprocess", "generate": "ControlNet", "select_image": "Scoring", "reconstruct": "TripoSR", "interior": "Shape", "refine": "Refine", "export": "Export",
+               "cad_read": "Read drawing", "cad_views": "Views", "cad_solid": "Solid"}
+STAGE_TITLES = dict(STAGES + CAD_STAGES)
+CAD_EXAMPLES = ["bracket_three_views.dxf", "back_wall_first_angle.dxf"]
+CAD_HELP = """**What the drawing should contain:** one part, drawn as a **front, top and side view** in model space (no border or title block, or put those on layers named BORDER / TITLE).
+
+- **Which view is which:** layers named **FRONT, TOP, SIDE** — or the standard layout: top view directly above (third-angle) or below (first-angle) the front view, side view level with it.
+- **Visible edges** as continuous lines, **hidden edges** with a HIDDEN/DASHED linetype; centre lines, text and dimensions are ignored.
+- **Holes:** a circle or closed shape inside a view is cut out when another view shows it with hidden lines (their length sets the depth). Without hidden lines it stays solid (a boss).
+- Built as the intersection of the three outlines, so curved shapes seen as a curve in only one view are approximated. Units follow the drawing (usually mm)."""
+PREP_TITLE = ("Sketch preprocessing", "Your input, the cleaned strokes, the ControlNet conditioning image and the filled silhouette used for scoring.")
+CAD_PREP_TITLE = ("Drawing analysis", "The views as Unveil read them (hidden lines dashed) and each view's filled outline; holes it will cut are red.")
 
 # Palette: ink #1a535c · aqua #4ecdc4 · mint #f7fff7 · coral #ff6b6b · sun #ffe66d
 INK = gr.themes.Color(
@@ -348,15 +360,20 @@ def _kw(cls, **kwargs):
     return cls(**{k: v for k, v in kwargs.items() if k in params})
 
 
+def _step_html(number: int, title: str, subtitle: str) -> str:
+    return f"<div class='step-title'><h3><span class='badge'>{number}</span>{title}</h3><p>{subtitle}</p></div>"
+
+
 def _step(number: int, title: str, subtitle: str) -> gr.HTML:
-    return gr.HTML(f"<div class='step-title'><h3><span class='badge'>{number}</span>{title}</h3><p>{subtitle}</p></div>")
+    return gr.HTML(_step_html(number, title, subtitle))
 
 
 class StageBoard:
-    def __init__(self, skip=()) -> None:
+    def __init__(self, skip=(), stages=STAGES) -> None:
         """skip: stages already finished in an earlier phase (e.g. the images, when only rebuilding 3D)."""
-        self.state = {key: ("done" if key in skip else "pending") for key, _ in STAGES}
-        self.notes = {key: ("from the image run" if key in skip else "") for key, _ in STAGES}
+        self.stages = stages
+        self.state = {key: ("done" if key in skip else "pending") for key, _ in stages}
+        self.notes = {key: ("from the image run" if key in skip else "") for key, _ in stages}
         self.started = {}
         self.elapsed = {}
         self.warnings = []
@@ -379,15 +396,17 @@ class StageBoard:
         for key, value in self.state.items():
             if value == "running":
                 self.state[key] = "pending"
-        self.headline = f"Stopped at “{dict(STAGES).get(stage, stage)}”."
+        self.headline = f"Stopped at “{STAGE_TITLES.get(stage, stage)}”."
 
     def finish(self, headline: str) -> None:
         self.headline = headline
 
-    def fraction(self, stages=STAGES) -> float:
+    def fraction(self, stages=None) -> float:
+        stages = stages or self.stages
         return sum(self.state[k] == "done" for k, _ in stages) / len(stages)
 
-    def html(self, stages=STAGES) -> str:
+    def html(self, stages=None) -> str:
+        stages = stages or self.stages
         states = [self.state[k] for k, _ in stages]
         running = "running" in states or ("error" not in states and 0 < self.fraction(stages) < 1)  # also between two stages
         total = f"{sum(self.elapsed.values()):.1f} s" if self.elapsed else ""
@@ -445,10 +464,26 @@ def _model_header(o) -> str:
 
 def _interior_note(o) -> str:
     lines = [f"**Interior:** {o.interior.describe()}"]
+    if o.symmetry:
+        lines.insert(0, f"**Symmetry:** {o.symmetry.describe()}")
     if o.hollow:
         lines.append(f"<span class='small-note'>{o.hollow.describe()}</span>")
     if o.interior.top_labels:
         lines.append("<span class='small-note'>CLIP top guesses: " + ", ".join(f"{label} {p:.2f}" for label, p in o.interior.top_labels) + "</span>")
+    lines.append("<span class='small-note'>Cross-section: a cut through the middle, front to back.</span>")
+    return "  \n".join(lines)
+
+
+def _cad_note(run: CadRun) -> str:
+    m = run.model
+    w, d, h = m.dimensions
+    lines = [
+        f"**Size:** {w:.4g} wide × {d:.4g} deep × {h:.4g} high ({m.units})",
+        f"<span class='small-note'>{m.projection} projection · views found by {'layer names' if m.view_source == 'layers' else 'their layout'}</span>",
+    ]
+    for hole in m.holes:
+        lo, hi = hole.depth_range
+        lines.append(f"<span class='small-note'>Hole cut from the {hole.view} view, depth {lo:.4g}–{hi:.4g} (hidden lines in the {hole.evidence} view)</span>")
     lines.append("<span class='small-note'>Cross-section: a cut through the middle, front to back.</span>")
     return "  \n".join(lines)
 
@@ -464,8 +499,8 @@ def _error_text(exc: Exception) -> str:
     elif isinstance(exc, SketchError):
         title, message, hint = "Couldn't read the sketch", str(exc), "Try darker, thicker strokes, or switch to Freeform."
     elif isinstance(exc, PipelineError):
-        stage = dict(STAGES).get(exc.stage, exc.stage)
-        title, message, hint = f"{stage} failed", str(exc), "Your sketch and settings are kept — adjust and try again."
+        stage = STAGE_TITLES.get(exc.stage, exc.stage)
+        title, message, hint = f"{stage} failed", str(exc), "Your inputs and settings are kept — adjust and try again."
     else:
         title, message, hint = "Unexpected error", f"{type(exc).__name__}: {exc}", "The full traceback is in the Colab / terminal log."
     return f"### ⚠️ {title}\n\n{message}" + (f"\n\n<span class='small-note'>{hint}</span>" if hint else "")
@@ -510,6 +545,12 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
                 )
             with gr.Row():
                 wall = gr.Slider(WALL_RANGE[0], WALL_RANGE[1], value=config.hollow.wall_fraction, step=0.005, label="Wall thickness (hollow objects, × object size)")
+                symmetric = gr.Checkbox(
+                    value=False,
+                    label="Front-back symmetric",
+                    info="Does it look the same from behind (a vase, a mug or car seen side-on)? The hidden back is then built as a mirror image of the front you drew.",
+                )
+            with gr.Row():
                 bake = gr.Checkbox(value=True, label="Bake UV texture (best colour in OBJ & other tools; ~10–30 s per model). Off = vertex colours.")
             with gr.Accordion("Advanced settings", open=False):
                 with gr.Row():
@@ -544,19 +585,28 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
                     upload = gr.Image(label="Sketch image (PNG/JPG; photos of paper sketches work)", type="pil", image_mode="RGBA", height=420)
                     example_dir = REPO_ROOT / "examples"
                     examples = [[str(example_dir / f), p] for f, p in EXAMPLES if (example_dir / f).exists()]
-            prompt = gr.Textbox(label="Describe the object (optional)", placeholder="e.g. a matte black ceramic vase with gold rim", lines=2)
-            with gr.Row():
-                run_btn = gr.Button("✨ Generate 3D", variant="primary", size="lg", scale=3)
-                images_btn = gr.Button("🖼️ Images first — I'll pick", variant="secondary", size="lg", scale=2)
-            if examples:
-                gr.Examples(examples=examples, inputs=[upload, prompt], label="Example sketches (load into the Upload tab)")
+                with gr.Tab("📐 CAD drawing") as cad_tab:
+                    cad_file = gr.File(label="AutoCAD drawing (.dxf or .dwg) with front, top and side views", file_types=[".dxf", ".dwg"], type="filepath")
+                    cad_btn = gr.Button("📐 Build 3D from drawing", variant="primary", size="lg")
+                    cad_examples = [[str(example_dir / f)] for f in CAD_EXAMPLES if (example_dir / f).exists()]
+                    if cad_examples:
+                        gr.Examples(examples=cad_examples, inputs=[cad_file], label="Example drawings")
+                    with gr.Accordion("How should the drawing look?", open=False):
+                        gr.Markdown(CAD_HELP)
+            with gr.Column() as sketch_controls:  # hidden while the CAD tab is open
+                prompt = gr.Textbox(label="Describe the object (optional)", placeholder="e.g. a matte black ceramic vase with gold rim", lines=2)
+                with gr.Row():
+                    run_btn = gr.Button("✨ Generate 3D", variant="primary", size="lg", scale=3)
+                    images_btn = gr.Button("🖼️ Images first — I'll pick", variant="secondary", size="lg", scale=2)
+                if examples:
+                    gr.Examples(examples=examples, inputs=[upload, prompt], label="Example sketches (load into the Upload tab)")
 
         # Everything below starts hidden and appears as soon as it has something to show.
         with gr.Column(elem_classes="card reveal", elem_id="progress-card", visible=False) as progress_card:
             status = gr.HTML(StageBoard().html())
 
         with gr.Column(elem_classes="card reveal", visible=False) as prep_card:
-            _step(3, "Sketch preprocessing", "Your input, the cleaned strokes, the ControlNet conditioning image and the filled silhouette used for scoring.")
+            prep_title = _step(3, *PREP_TITLE)
             prep_gallery = _kw(gr.Gallery, columns=4, height="auto", object_fit="contain", show_label=False, preview=False)
 
         with gr.Column(elem_classes="card reveal", visible=False) as var_card:
@@ -611,7 +661,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
         error_outputs = [err_box, err_md]
 
         # ------------------------------------------------------------------ helpers
-        def read_opts(prompt_v, mode_v, interior_v, wall_v, bake_v, depth_v, seed_v, nvar_v, steps_v, cfg_v, topk_v, mc_v, smooth_v, tex_v, neg_v) -> RunOptions:
+        def read_opts(prompt_v, mode_v, interior_v, wall_v, sym_v, bake_v, depth_v, seed_v, nvar_v, steps_v, cfg_v, topk_v, mc_v, smooth_v, tex_v, neg_v) -> RunOptions:
             return RunOptions(
                 prompt=prompt_v or "",
                 negative_prompt=neg_v or "",
@@ -628,6 +678,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
                 depth_scale=float(depth_v),
                 interior=interior_v or "auto",
                 wall_thickness=float(wall_v),
+                front_back_symmetric=bool(sym_v),
             )
 
         def popup(exc: Exception) -> dict:
@@ -713,6 +764,8 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
                     out = {status: board.html(stages)}
                     if "prep_images" in ev.payload:
                         out.update({prep_card: gr.update(visible=True), prep_gallery: ev.payload["prep_images"]})
+                    if "cad_images" in ev.payload:
+                        out.update({prep_card: gr.update(visible=True), prep_gallery: ev.payload["cad_images"]})
                     if "variations" in ev.payload:
                         out.update({var_card: gr.update(visible=True), var_gallery: ev.payload["variations"]})
                     if "image_run" in ev.payload:
@@ -737,7 +790,7 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
             board.headline = "Starting…"
             first = clear_models()
             first.update({
-                status: board.html(stages), progress_card: gr.update(visible=True), prep_card: gr.update(visible=False), prep_gallery: [],
+                status: board.html(stages), progress_card: gr.update(visible=True), prep_card: gr.update(visible=False), prep_gallery: [], prep_title: _step_html(3, *PREP_TITLE),
                 var_card: gr.update(visible=False), var_gallery: [], pick_box: gr.update(visible=False), score_table: "",
                 details_card: gr.update(visible=False), details: None, pick: gr.update(choices=[], value=[]), image_state: None,
             })
@@ -776,6 +829,33 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
             if isinstance(final, RunResult):
                 yield show_result(final, board)
 
+        def on_cad(path, depth_v):
+            if not path:
+                raise InputError("Upload a .dxf or .dwg drawing first (or pick an example drawing).")
+            board = StageBoard(stages=CAD_STAGES)
+            board.headline = "Reading the drawing…"
+            first = clear_models()
+            first.update({
+                status: board.html(), progress_card: gr.update(visible=True), prep_card: gr.update(visible=False), prep_gallery: [], prep_title: _step_html(3, *CAD_PREP_TITLE),
+                var_card: gr.update(visible=False), var_gallery: [], pick_box: gr.update(visible=False), score_table: "",
+                details_card: gr.update(visible=False), details: None, pick: gr.update(choices=[], value=[]), image_state: None,
+            })
+            yield first
+            final = yield from stream(get_pipe().run_cad(Path(path), float(depth_v)), board, CAD_STAGES)
+            if isinstance(final, CadRun):
+                board.warnings = final.warnings
+                board.finish(f"Done — solid built from {final.source}.")
+                out = clear_models()
+                out.update(show_bundles([final.bundle], final.all_zip))
+                s0 = slots[0]
+                out.update({
+                    s0["card"]: gr.update(visible=True), s0["header"]: f"#### Model from your drawing · {html.escape(final.source)}",
+                    s0["section"]: final.section, s0["info"]: _cad_note(final),
+                    status: board.html(), final_card: gr.update(visible=True), details_card: gr.update(visible=True), details: to_jsonable(final.summary),
+                    run_state: {"run_id": final.run_id, "build_dir": str(final.build_dir), "textured": True},  # flat colour: nothing to bake
+                })
+                yield out
+
         def on_depth(run, value):
             preset_name = next((k for k, v in DEPTH_PRESETS.items() if abs(v - value) < 1e-6), CUSTOM)
             if not run:
@@ -798,17 +878,19 @@ def build_demo(config: Optional[UnveilConfig] = None, preload: bool = False) -> 
             })
             return out
 
-        settings = [prompt, mode, interior, wall, bake, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
-        build_settings = [interior, wall, bake, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
+        settings = [prompt, mode, interior, wall, symmetric, bake, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
+        build_settings = [interior, wall, symmetric, bake, depth, seed, num_variations, steps, guidance, top_k, mc_res, smooth, tex_res, negative]
         sections = [progress_card, prep_card, var_card, pick_box, cand_card, final_card, details_card]
-        outputs = [status, prep_gallery, var_gallery, score_table, pick, image_state, cand_gallery, details, run_state, bake_btn, all_zip, final_note] + sections + slot_components + error_outputs
+        outputs = [status, prep_title, prep_gallery, var_gallery, score_table, pick, image_state, cand_gallery, details, run_state, bake_btn, all_zip, final_note] + sections + slot_components + error_outputs
         run_btn.click(guarded(on_generate), [sketchpad, upload, input_source] + settings, outputs, concurrency_limit=1, show_progress="hidden")
         images_btn.click(guarded(on_images), [sketchpad, upload, input_source] + settings, outputs, concurrency_limit=1, show_progress="hidden")
         build_btn.click(guarded(on_build), [image_state, pick] + build_settings, outputs, concurrency_limit=1, show_progress="hidden")
+        cad_btn.click(guarded(on_cad), [cad_file, depth], outputs, concurrency_limit=1, show_progress="hidden")
         err_close.click(lambda: gr.update(visible=False), None, err_box, show_progress="hidden")
 
-        draw_tab.select(lambda: "draw", None, input_source)
-        upload_tab.select(lambda: "upload", None, input_source)
+        draw_tab.select(lambda: ("draw", gr.update(visible=True)), None, [input_source, sketch_controls])
+        upload_tab.select(lambda: ("upload", gr.update(visible=True)), None, [input_source, sketch_controls])
+        cad_tab.select(lambda: gr.update(visible=False), None, sketch_controls)
         upload.change(lambda img: "upload" if img is not None else gr.update(), upload, input_source)
         clear_btn.click(lambda: None, None, sketchpad)
 
