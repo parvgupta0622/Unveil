@@ -40,7 +40,7 @@ CAD_HELP = """**What the drawing should contain:** one part, drawn as a **front,
 - Built as the intersection of the three outlines, so curved shapes seen as a curve in only one view are approximated. Units follow the drawing (usually mm)."""
 PREP_TITLE = ("Sketch preprocessing", "Your input, the cleaned strokes, the ControlNet conditioning image and the filled silhouette used for scoring.")
 GUIDE_HELP = """Optional. TripoSR only sees the front, so it has to guess how deep the object is and what the back looks like.
-Draw the outline **from the side** and/or **from above** and the model is trimmed to fit it (nothing is added, the front is kept).
+Upload or draw the outline **from the side** and/or **from above** and the model is trimmed to fit it (nothing is added, the front is kept). Images are read like the main sketch: line drawings, filled shapes and photos of paper sketches all work.
 
 - **Side view:** the object seen from its side, same way up. Say below which way its front faces.
 - **Top view:** looking down on it, with its front at the **bottom** of the canvas.
@@ -461,11 +461,14 @@ class StageBoard:
 
 
 def _guide_pad(label: str):
+    """Upload an image (a photo of a paper sketch works) or draw directly."""
     return _kw(
         gr.Sketchpad,
         label=label,
         type="pil",
         image_mode="RGBA",
+        sources=("upload", "clipboard"),
+        placeholder="Upload an image, or draw",
         canvas_size=(384, 384),
         brush=_kw(gr.Brush, default_size=4, colors=["#000000"], color_mode="fixed"),
         eraser=_kw(gr.Eraser, default_size=16),
