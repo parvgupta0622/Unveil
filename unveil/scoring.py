@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from .config import ScoringConfig
-from .utils import LOG
+from .utils import LOG, load_without_empty_weights
 
 # Typical cosine ranges for CLIP ViT-B/32, used to map raw similarities onto [0, 1].
 TEXT_COS_RANGE = (0.15, 0.35)
@@ -86,7 +86,8 @@ class ClipScorer:
         from transformers import CLIPModel, CLIPProcessor
 
         LOG.info("Loading CLIP %s", self.model_id)
-        self._model = CLIPModel.from_pretrained(self.model_id, torch_dtype=self.dtype).to(self.device).eval()
+        model = load_without_empty_weights(lambda **extra: CLIPModel.from_pretrained(self.model_id, torch_dtype=self.dtype, **extra), self.model_id)
+        self._model = model.to(self.device).eval()
         self._processor = CLIPProcessor.from_pretrained(self.model_id)
 
     def to(self, device: str) -> None:

@@ -7,7 +7,7 @@ from typing import Callable, Dict, Optional
 from PIL import Image
 
 from .config import CreativityLevel, GenerationConfig
-from .utils import LOG
+from .utils import LOG, load_without_empty_weights
 
 
 @dataclass
@@ -39,6 +39,9 @@ class SketchImageGenerator:
         return self._pipe is not None
 
     def _from_pretrained(self, cls, repo: str, **kwargs):
+        return load_without_empty_weights(lambda **extra: self._load(cls, repo, **kwargs, **extra), repo)
+
+    def _load(self, cls, repo: str, **kwargs):
         import torch
 
         if self.dtype == torch.float16:

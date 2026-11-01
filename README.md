@@ -279,7 +279,7 @@ pip install pytest
 python -m pytest -q tests
 ```
 
-62 CPU-only tests, plus 2 that need the TripoSR source (no model weights needed):
+64 CPU-only tests, plus 2 that need the TripoSR source (no model weights needed):
 - **Preprocessing:** outline → filled silhouette, inverted inputs, photos with uneven lighting, filled shapes, open strokes, speck noise, recentring, empty canvas errors.
 - **Mesh:** floater removal + winding repair, smoothing/decimation keeping colours, depth scaling changes only Z, projection orientation, silhouette scoring and flat-mesh rejection, texture bake correctness (colour sampled through the UVs), GLB/OBJ export + validation round-trips. **Hollowing:** solid voxelisation matches the true volume, a solid mug becomes a watertight open shell with a hollow middle and a solid handle, thin objects are refused, and hollow/solid is decided from prompts (including tricky ones like "a lamp with a glass shade"), from CLIP, or from the override. A mug tilted 25° (as a sketch drawn from above produces) opens fully along its own axis. **Symmetry:** a shifted symmetric object keeps its shape and volume, and a wrong guessed back (a box behind a sphere) is replaced by the mirrored front, watertight.
 - **Guide views, holes and confidence:** a too-deep box trimmed to an L-shaped side profile keeps its front and gets the right volume (also with the outline facing the other way), a top view trims a tapering footprint, a fitting guide leaves the mesh untouched, a mismatched guide is refused, a see-through hole is found only when the image and the sketch agree and is then drilled through a filled plate, and the confidence map is low where attempts agree and visible, high where they disagree, lowered by guides, and its heatmap OBJ survives re-indexed vertices and depth scaling.
@@ -316,6 +316,7 @@ python -m pytest -q tests
 |---|---|
 | `CUDA out of memory` | Relaunch with `python app.py --share --low-vram`; use 3 variations, 1 image to TripoSR, marching cubes 192. |
 | `No module named tsr` / TripoSR clone failed | Re-run `bash scripts/setup_colab.sh`, or `git clone https://github.com/VAST-AI-Research/TripoSR third_party/TripoSR`, or set `UNVEIL_TRIPOSR_PATH`. |
+| `NotImplementedError: Cannot copy out of meta tensor; no data!` | A library update expects a weight the downloaded checkpoint lacks, and the fast loader left it empty. Fixed: Unveil now detects this and reloads that model with full initialisation (the log names the weights). Pull the latest code and restart the runtime. |
 | `Missing key(s) in state_dict … image_tokenizer.model.layers…` | transformers 5 renamed ViT layers. Fixed in `unveil/reconstruction/triposr.py` (`adapt_state_dict` remaps the checkpoint). Pull the latest code. |
 | pip prints "dependency resolver … conflicts" (google-genai, google-adk, fasthtml, hf-gradio) during setup | Harmless: these are Colab-preinstalled packages that Unveil does not use; the conflicts come from Gradio 5 pinning older `starlette`/`gradio-client`. Setup is fine if it ends with `Unveil setup OK`. |
 | "The sketch looks empty" | Strokes too faint or tiny. Use a darker or thicker pen, or upload a higher-contrast scan. |
